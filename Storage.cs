@@ -60,6 +60,8 @@ public sealed class AppSettings
     /// <summary>Часовой пояс для «сегодня» (UTC+N). 3 — Москва.</summary>
     public int TimezoneHours { get; set; } = 3;
 
+    public S3Settings S3 { get; set; } = new();
+
     public string? LastExportDir { get; set; }
     public int WindowWidth { get; set; } = 1250;
     public int WindowHeight { get; set; } = 780;
@@ -75,6 +77,9 @@ public sealed class AppSettings
         var def = new AppSettings();
         if (string.IsNullOrWhiteSpace(CacheDir)) CacheDir = def.CacheDir;
         if (string.IsNullOrWhiteSpace(HistoryDir)) HistoryDir = def.HistoryDir;
+        S3 ??= new S3Settings();
+        if (string.IsNullOrWhiteSpace(S3.Endpoint)) S3.Endpoint = def.S3.Endpoint;
+        if (string.IsNullOrWhiteSpace(S3.Region)) S3.Region = def.S3.Region;
         KeepHistoryDays = Math.Clamp(KeepHistoryDays, 1, 365);
         NetworkTolerancePercent = Math.Clamp(NetworkTolerancePercent, 0, 100);
         GeoDropPercent = Math.Clamp(GeoDropPercent, 0, 100);

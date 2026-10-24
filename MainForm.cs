@@ -24,6 +24,7 @@ public sealed class MainForm : Form
     private readonly Button _btnStart = new() { Text = "▶ Старт", AutoSize = true };
     private readonly Button _btnStop = new() { Text = "■ Стоп", AutoSize = true };
     private readonly Button _btnAddNet = new() { Text = "＋ Сеть…", AutoSize = true };
+    private readonly Button _btnImportS3 = new() { Text = "Сети из S3…", AutoSize = true };
     private readonly Button _btnEditNet = new() { Text = "Изменить…", AutoSize = true };
     private readonly Button _btnDelNet = new() { Text = "Удалить", AutoSize = true };
     private readonly Button _btnSettings = new() { Text = "Настройки…", AutoSize = true };
@@ -93,6 +94,7 @@ public sealed class MainForm : Form
         bar.Controls.Add(_btnStop);
         _btnAddNet.Margin = new Padding(24, 3, 3, 3);
         bar.Controls.Add(_btnAddNet);
+        bar.Controls.Add(_btnImportS3);
         bar.Controls.Add(_btnEditNet);
         bar.Controls.Add(_btnDelNet);
         bar.Controls.Add(_btnSettings);
@@ -183,6 +185,7 @@ public sealed class MainForm : Form
             _status.Text = "Останавливаю…";
         };
         _btnAddNet.Click += (_, _) => OnAddNetwork();
+        _btnImportS3.Click += (_, _) => OnImportFromS3();
         _btnEditNet.Click += (_, _) => OnEditNetwork();
         _btnDelNet.Click += (_, _) => OnDeleteNetwork();
         _btnSettings.Click += (_, _) => OnSettings();
@@ -225,6 +228,7 @@ public sealed class MainForm : Form
         _btnStart.Enabled = !running;
         _btnStop.Enabled = running;
         _btnAddNet.Enabled = !running;
+        _btnImportS3.Enabled = !running;
         _btnEditNet.Enabled = !running;
         _btnDelNet.Enabled = !running;
         _btnSettings.Enabled = !running;
@@ -349,7 +353,7 @@ public sealed class MainForm : Form
 
     private void OnAddNetwork()
     {
-        using var dlg = new NetworkDialog(null, _storage.Networks.Select(n => n.Name).ToList());
+        using var dlg = new NetworkDialog(null, _storage.Networks.Select(n => n.Name).ToList(), Settings.S3.Bucket);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         _storage.Networks.Add(dlg.Result);
         SaveStorage();
@@ -361,7 +365,7 @@ public sealed class MainForm : Form
         var net = Selected();
         if (net is null) return;
         var others = _storage.Networks.Where(n => n.Id != net.Id).Select(n => n.Name).ToList();
-        using var dlg = new NetworkDialog(net.Clone(), others);
+        using var dlg = new NetworkDialog(net.Clone(), others, Settings.S3.Bucket);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         int index = _storage.Networks.FindIndex(n => n.Id == net.Id);
@@ -386,6 +390,65 @@ public sealed class MainForm : Form
         _lastRecords.Remove(net.Id);
         SaveStorage();
         RefreshList(null);
+    }
+
+    private async void OnImportFromS3()
+    {
+        var s3 = Settings.S3;
+        if (!s3.IsConfigured || string.IsNullOrWhiteSpace(s3.Bucket))
+        {
+            MessageBox.Show(this, "Сначала заполните раздел S3 в «Настройках»: бакет, идентификатор и секретный ключ.",
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _btnImportS3.Enabled = false;
+        _status.Text = "Получаю список папок в S3…";
+        try
+        {
+            var client = S3Client.FromSettings(s3);
+            var listing = await Task.Run(() => client.ListAsync(s3.Bucket, "", CancellationToken.None));
+
+            var used = new HashSet<string>(_storage.Networks.SelectMany(n => n.Sources), StringComparer.OrdinalIgnoreCase);
+            var folders = listing.Folders.Where(f => !used.Contains($"s3://{s3.Bucket}/{f}")).ToList();
+            int already = listing.Folders.Count - folders.Count;
+            if (folders.Count == 0)
+            {
+                MessageBox.Show(this,
+                    listing.Folders.Count == 0 ? "В бакете нет папок." : "Все папки бакета уже добавлены как сети.",
+                    Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                _status.Text = "Новых папок в S3 нет.";
+                return;
+            }
+
+            using var dlg = new S3ImportDialog(s3.Bucket, folders, already);
+            if (dlg.ShowDialog(this) != DialogResult.OK) { _status.Text = ""; return; }
+
+            var names = new HashSet<string>(_storage.Networks.Select(n => n.Name), StringComparer.CurrentCultureIgnoreCase);
+            string? lastId = null;
+            foreach (var folder in dlg.Selected)
+            {
+                string baseName = folder.TrimEnd('/');
+                string name = baseName;
+                for (int k = 2; !names.Add(name); k++) name = $"{baseName} ({k})";
+                var net = new NetworkConfig { Name = name, Sources = { $"s3://{s3.Bucket}/{folder}" } };
+                _storage.Networks.Add(net);
+                lastId = net.Id;
+            }
+
+            SaveStorage();
+            RefreshList(lastId);
+            _status.Text = $"Добавлено сетей из S3: {dlg.Selected.Count}.";
+        }
+        catch (Exception ex)
+        {
+            _status.Text = "Ошибка S3: " + ex.Message;
+            MessageBox.Show(this, ex.Message, "Не удалось получить список папок S3", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _btnImportS3.Enabled = true;
+        }
     }
 
     private void OnSettings()

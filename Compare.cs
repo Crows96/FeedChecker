@@ -190,7 +190,12 @@ public static class NetworkChecker
             return result;
         }
 
-        var options = new RunOptions { CacheDir = settings.CacheDir, DeleteDownloaded = settings.DeleteDownloaded };
+        var options = new RunOptions
+        {
+            CacheDir = settings.CacheDir,
+            DeleteDownloaded = settings.DeleteDownloaded,
+            S3 = settings.S3.IsConfigured ? S3Client.FromSettings(settings.S3) : null,
+        };
         var sources = net.Sources.Select(v => new FeedSource(v)).ToList();
         var run = new FeedRunner().Run(sources, net.Name, options, progress, null, ct);
         result.Run = run;

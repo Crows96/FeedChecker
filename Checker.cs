@@ -715,16 +715,28 @@ public static class FeedDownloader
 }
 
 // ===================== Запуск по списку источников =====================
+
 public sealed record FeedSource(string Value, string? Label = null)
 {
     public bool IsUrl => Value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                          || Value.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsS3 => Value.StartsWith("s3://", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Адрес S3-папки (оканчивается на «/» или указывает на корень бакета).</summary>
+    public bool IsS3Folder => IsS3 && S3Path.TryParse(Value, out _, out var key) && (key.Length == 0 || key.EndsWith('/'));
 
     public string DisplayName
     {
         get
         {
             if (!string.IsNullOrWhiteSpace(Label)) return Label!;
+            if (IsS3)
+            {
+                if (IsS3Folder || !S3Path.TryParse(Value, out _, out var key)) return Value;
+                int slash = key.LastIndexOf('/');
+                return slash < 0 ? key : key[(slash + 1)..];
+            }
             if (IsUrl && Uri.TryCreate(Value, UriKind.Absolute, out var u))
             {
                 var last = Path.GetFileName(u.AbsolutePath.TrimEnd('/'));
@@ -740,6 +752,8 @@ public sealed class RunOptions
     public string CacheDir { get; set; } = Path.Combine(Path.GetTempPath(), "FeedChecker", "cache");
     public bool DeleteDownloaded { get; set; } = true;
     public AnalyzerOptions Analyzer { get; set; } = new();
+    /// <summary>Клиент S3; нужен, если среди источников есть s3://…</summary>
+    public S3Client? S3 { get; set; }
 }
 
 public sealed record RunProgress(int SourceIndex, int SourceCount, string SourceName, string Phase, double Overall);
@@ -751,7 +765,7 @@ public sealed class RunResult
     public bool Cancelled { get; set; }
 }
 
-/// <summary>Последовательно проверяет список источников (файлы и ссылки) как одну сеть.</summary>
+/// <summary>Последовательно проверяет список источников (файлы, ссылки, S3-папки) как одну сеть.</summary>
 public sealed class FeedRunner
 {
     public RunResult Run(IReadOnlyList<FeedSource> sources, string networkName, RunOptions opt,
@@ -760,15 +774,47 @@ public sealed class FeedRunner
         var result = new RunResult();
         var analyzer = new FeedAnalyzer(opt.Analyzer);
 
-        for (int i = 0; i < sources.Count; i++)
+        // S3-папки раскрываем в список файлов; ошибка листинга становится «невалидным источником»
+        var work = new List<(FeedSource Src, string? Error)>();
+        foreach (var s in sources)
+        {
+            if (!s.IsS3Folder) { work.Add((s, null)); continue; }
+            try
+            {
+                if (opt.S3 is null) throw new InvalidOperationException("Не заданы ключи доступа S3 (Настройки → S3).");
+                var files = opt.S3.ListFeedSourcesAsync(s.Value, ct).GetAwaiter().GetResult();
+                if (files.Count == 0) throw new InvalidOperationException("В S3-папке нет файлов .json: " + s.Value);
+                foreach (var f in files) work.Add((f, null));
+            }
+            catch (OperationCanceledException)
+            {
+                result.Cancelled = true;
+                break;
+            }
+            catch (Exception ex) when (ex is S3Exception or InvalidOperationException or HttpRequestException)
+            {
+                work.Add((s, ex.Message));
+            }
+        }
+
+        for (int i = 0; i < work.Count && !result.Cancelled; i++)
         {
             if (ct.IsCancellationRequested) { result.Cancelled = true; break; }
-            var src = sources[i];
+            var (src, listError) = work[i];
             string name = src.DisplayName;
             string? downloaded = null;
 
             void Report(string phase, double fraction) =>
-                progress?.Report(new RunProgress(i, sources.Count, name, phase, (i + Math.Clamp(fraction, 0, 1)) / sources.Count));
+                progress?.Report(new RunProgress(i, work.Count, name, phase, (i + Math.Clamp(fraction, 0, 1)) / work.Count));
+
+            if (listError is not null)
+            {
+                var bad = new FeedFileResult(name, opt.Analyzer.MaxIssuesPerCode) { IsValid = false, InvalidReason = listError };
+                bad.Issues.Add(IssueCode.InvalidFeed, name, "", listError);
+                result.Files.Add(bad);
+                onFileDone?.Invoke(i, bad);
+                continue;
+            }
 
             try
             {
@@ -779,6 +825,17 @@ public sealed class FeedRunner
                     Report("Скачивание", 0);
                     var dl = new Progress<double>(p => Report("Скачивание", p * 0.5));
                     downloaded = FeedDownloader.DownloadAsync(src.Value, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
+                    path = downloaded;
+                    analysisStart = 0.5; analysisSpan = 0.5;
+                }
+                else if (src.IsS3)
+                {
+                    if (opt.S3 is null) throw new InvalidOperationException("Не заданы ключи доступа S3 (Настройки → S3).");
+                    if (!S3Path.TryParse(src.Value, out var bucket, out var key))
+                        throw new InvalidOperationException("Неверный адрес S3: " + src.Value);
+                    Report("Скачивание", 0);
+                    var dl = new Progress<double>(p => Report("Скачивание", p * 0.5));
+                    downloaded = opt.S3.DownloadAsync(bucket, key, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
                     path = downloaded;
                     analysisStart = 0.5; analysisSpan = 0.5;
                 }
@@ -794,10 +851,10 @@ public sealed class FeedRunner
                 result.Cancelled = true;
                 break;
             }
-            catch (Exception ex) when (ex is HttpRequestException or IOException or UnauthorizedAccessException or InvalidOperationException)
+            catch (Exception ex) when (ex is HttpRequestException or IOException or UnauthorizedAccessException or InvalidOperationException or S3Exception)
             {
                 var failed = new FeedFileResult(name, opt.Analyzer.MaxIssuesPerCode) { IsValid = false, InvalidReason = ex.Message };
-                failed.Issues.Add(IssueCode.InvalidFeed, name, "", (src.IsUrl ? "Не удалось скачать: " : "Не удалось открыть: ") + ex.Message);
+                failed.Issues.Add(IssueCode.InvalidFeed, name, "", (src.IsUrl || src.IsS3 ? "Не удалось скачать: " : "Не удалось открыть: ") + ex.Message);
                 result.Files.Add(failed);
                 onFileDone?.Invoke(i, failed);
             }
@@ -811,7 +868,7 @@ public sealed class FeedRunner
         }
 
         result.Summary = NetworkSummary.Build(networkName, result.Files);
-        progress?.Report(new RunProgress(sources.Count, sources.Count, "", result.Cancelled ? "Остановлено" : "Готово", result.Cancelled ? 0 : 1));
+        progress?.Report(new RunProgress(work.Count, work.Count, "", result.Cancelled ? "Остановлено" : "Готово", result.Cancelled ? 0 : 1));
         return result;
     }
 }
