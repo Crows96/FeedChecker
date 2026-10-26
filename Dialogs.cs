@@ -39,15 +39,15 @@ internal sealed class NetworkDialog : Form
     private readonly TextBox _tol = new();
     private readonly NetworkConfig _cfg;
     private readonly List<string> _otherNames;
-    private readonly string _bucket;
+    private readonly List<string> _buckets;
 
     public NetworkConfig Result => _cfg;
 
-    public NetworkDialog(NetworkConfig? existing, List<string> otherNames, string defaultBucket)
+    public NetworkDialog(NetworkConfig? existing, List<string> otherNames, List<string> buckets)
     {
         _cfg = existing ?? new NetworkConfig();
         _otherNames = otherNames;
-        _bucket = defaultBucket;
+        _buckets = buckets;
 
         Text = existing is null ? "Новая сеть" : "Сеть: " + existing.Name;
         Font = new Font("Segoe UI", 9F);
@@ -163,26 +163,9 @@ internal sealed class NetworkDialog : Form
 
     private void OnAddS3()
     {
-        var text = InputBox.Show(this, "Добавить S3-папку",
-            "Папка в бакете (например: winelab/) или полный адрес вида s3://бакет/папка/");
-        if (string.IsNullOrWhiteSpace(text)) return;
-
-        string value = text.Trim();
-        if (!value.StartsWith("s3://", StringComparison.OrdinalIgnoreCase))
-        {
-            if (string.IsNullOrWhiteSpace(_bucket))
-            {
-                Warn("Сначала укажите бакет в «Настройках» (раздел S3) или введите полный адрес s3://бакет/папка/");
-                return;
-            }
-            value = $"s3://{_bucket}/{value.Trim('/')}/";
-        }
-        else if (!value.EndsWith('/') && !value.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-        {
-            value += "/"; // без «/» на конце считаем, что это папка
-        }
-
-        AddSource(value);
+        using var dlg = new S3AddDialog(_buckets);
+        if (dlg.ShowDialog(this) != DialogResult.OK || dlg.Result is null) return;
+        AddSource(dlg.Result);
     }
 
     private static bool TryNum(string text, out double? value)
@@ -231,7 +214,7 @@ internal sealed class NetworkDialog : Form
         MessageBox.Show(this, text, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
 }
 
-/// <summary>Окно «Настройки»: папки кэша и истории, пороги сравнения, доступ к S3.</summary>
+/// <summary>Окно «Настройки»: общие параметры и доступ к S3 (один или два бакета).</summary>
 internal sealed class SettingsDialog : Form
 {
     private readonly AppSettings _s;
@@ -242,14 +225,8 @@ internal sealed class SettingsDialog : Form
     private readonly NumericUpDown _tol = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _geoDrop = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _tz = new() { Minimum = -12, Maximum = 14 };
-
-    private readonly TextBox _s3Endpoint = new();
-    private readonly TextBox _s3Region = new();
-    private readonly TextBox _s3Bucket = new();
-    private readonly TextBox _s3Key = new();
-    private readonly TextBox _s3Secret = new() { UseSystemPasswordChar = true };
-    private readonly Button _s3Test = new() { Text = "Проверить подключение" };
-    private readonly Label _s3Info = new() { AutoSize = true, MaximumSize = new Size(600, 0) };
+    private readonly S3Editor _s3a;
+    private readonly S3Editor _s3b;
 
     public SettingsDialog(AppSettings settings)
     {
@@ -261,33 +238,35 @@ internal sealed class SettingsDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(640, 624);
+        ClientSize = new Size(660, 500);
 
-        AddFolderRow("Папка кэша (скачанные фиды):", _cache, 14);
-        AddFolderRow("Папка истории проверок:", _history, 76);
+        var tabs = new TabControl { Left = 8, Top = 8, Width = 644, Height = 440 };
+        var general = new TabPage("Общие");
+        var pageA = new TabPage("S3: бакет 1");
+        var pageB = new TabPage("S3: бакет 2 (необязательно)");
+        tabs.TabPages.Add(general);
+        tabs.TabPages.Add(pageA);
+        tabs.TabPages.Add(pageB);
+        Controls.Add(tabs);
 
+        AddFolderRow(general, "Папка кэша (скачанные фиды):", _cache, 14);
+        AddFolderRow(general, "Папка истории проверок:", _history, 76);
         _delete.SetBounds(12, 136, 400, 24);
-        Controls.Add(_delete);
+        general.Controls.Add(_delete);
+        AddNumberRow(general, "Хранить историю, дней:", _days, 176, "");
+        AddNumberRow(general, "Допуск изменения по сети, %:", _tol, 208, "к прошлой проверке и к среднему за период");
+        AddNumberRow(general, "Порог падения офферов у гео, %:", _geoDrop, 240, "предупреждать, если у магазина/региона стало меньше на столько");
+        AddNumberRow(general, "Часовой пояс для «сегодня» (UTC+):", _tz, 272, "3 — Москва");
 
-        AddNumberRow("Хранить историю, дней:", _days, 176, "");
-        AddNumberRow("Допуск изменения по сети, %:", _tol, 208, "к прошлой проверке и к среднему за период");
-        AddNumberRow("Порог падения офферов у гео, %:", _geoDrop, 240, "предупреждать, если у магазина/региона стало меньше на столько");
-        AddNumberRow("Часовой пояс для «сегодня» (UTC+):", _tz, 272, "3 — Москва");
+        var existing = _s.S3Connections;
+        _s3a = new S3Editor(pageA, existing.Count > 0 ? existing[0] : null, null, null,
+            "Основной бакет. Если бакет один, второй вкладкой можно не пользоваться.");
+        _s3b = new S3Editor(pageB, existing.Count > 1 ? existing[1] : null, existing.Count > 0 ? existing[0] : null,
+            _s3a.EffectiveSecret,
+            "Второй бакет. Оставьте поле «Бакет» пустым, если он не нужен. Если ключи те же, что у первого, секретный ключ вводить не нужно.");
 
-        var grp = new GroupBox { Text = "Хранилище S3 (Yandex Object Storage)", Left = 12, Top = 312, Width = 616, Height = 242 };
-        AddS3Row(grp, "Адрес сервиса:", _s3Endpoint, 26);
-        AddS3Row(grp, "Регион:", _s3Region, 56);
-        AddS3Row(grp, "Бакет:", _s3Bucket, 86);
-        AddS3Row(grp, "Идентификатор ключа:", _s3Key, 116);
-        AddS3Row(grp, "Секретный ключ:", _s3Secret, 146);
-        _s3Test.SetBounds(200, 182, 190, 28);
-        grp.Controls.Add(_s3Test);
-        _s3Info.Location = new Point(12, 214);
-        grp.Controls.Add(_s3Info);
-        Controls.Add(grp);
-
-        var ok = new Button { Text = "OK", Left = 452, Top = 580, Width = 85 };
-        var cancel = new Button { Text = "Отмена", Left = 543, Top = 580, Width = 85, DialogResult = DialogResult.Cancel };
+        var ok = new Button { Text = "OK", Left = 470, Top = 458, Width = 85 };
+        var cancel = new Button { Text = "Отмена", Left = 561, Top = 458, Width = 85, DialogResult = DialogResult.Cancel };
         Controls.AddRange(new Control[] { ok, cancel });
         AcceptButton = ok;
         CancelButton = cancel;
@@ -300,74 +279,30 @@ internal sealed class SettingsDialog : Form
         _geoDrop.Value = (decimal)Math.Clamp(_s.GeoDropPercent, 0, 100);
         _tz.Value = Math.Clamp(_s.TimezoneHours, -12, 14);
 
-        _s3Endpoint.Text = _s.S3.Endpoint;
-        _s3Region.Text = _s.S3.Region;
-        _s3Bucket.Text = _s.S3.Bucket;
-        _s3Key.Text = _s.S3.AccessKeyId;
-        if (!string.IsNullOrEmpty(_s.S3.SecretKeyEncrypted))
-            _s3Info.Text = "Секретный ключ сохранён (в зашифрованном виде). Оставьте поле пустым, чтобы не менять его.";
-
-        _s3Test.Click += (_, _) => OnTestS3();
         ok.Click += (_, _) => OnOk();
     }
 
-    private void AddFolderRow(string caption, TextBox box, int top)
+    private void AddFolderRow(Control page, string caption, TextBox box, int top)
     {
-        Controls.Add(new Label { Text = caption, Left = 12, Top = top, AutoSize = true });
+        page.Controls.Add(new Label { Text = caption, Left = 12, Top = top, AutoSize = true });
         box.SetBounds(12, top + 22, 520, 24);
-        Controls.Add(box);
+        page.Controls.Add(box);
         var browse = new Button { Text = "Обзор…", Left = 540, Top = top + 21, Width = 88 };
         browse.Click += (_, _) =>
         {
             using var dlg = new FolderBrowserDialog { SelectedPath = box.Text, UseDescriptionForTitle = true, Description = caption };
             if (dlg.ShowDialog(this) == DialogResult.OK) box.Text = dlg.SelectedPath;
         };
-        Controls.Add(browse);
+        page.Controls.Add(browse);
     }
 
-    private void AddNumberRow(string caption, NumericUpDown box, int top, string hint)
+    private static void AddNumberRow(Control page, string caption, NumericUpDown box, int top, string hint)
     {
-        Controls.Add(new Label { Text = caption, Left = 12, Top = top + 3, AutoSize = true });
+        page.Controls.Add(new Label { Text = caption, Left = 12, Top = top + 3, AutoSize = true });
         box.SetBounds(270, top, 80, 24);
-        Controls.Add(box);
+        page.Controls.Add(box);
         if (hint.Length > 0)
-            Controls.Add(new Label { Text = hint, Left = 360, Top = top + 3, AutoSize = true, ForeColor = SystemColors.GrayText });
-    }
-
-    private static void AddS3Row(GroupBox g, string caption, TextBox box, int y)
-    {
-        g.Controls.Add(new Label { Text = caption, Left = 12, Top = y + 4, AutoSize = true });
-        box.SetBounds(200, y, 400, 24);
-        g.Controls.Add(box);
-    }
-
-    private async void OnTestS3()
-    {
-        string bucket = _s3Bucket.Text.Trim();
-        string keyId = _s3Key.Text.Trim();
-        string secret = _s3Secret.Text.Length > 0 ? _s3Secret.Text : _s.S3.GetSecret();
-        if (bucket.Length == 0 || keyId.Length == 0 || secret.Length == 0)
-        {
-            _s3Info.Text = "Заполните бакет, идентификатор и секретный ключ.";
-            return;
-        }
-
-        _s3Test.Enabled = false;
-        _s3Info.Text = "Проверяю подключение…";
-        try
-        {
-            var client = new S3Client(_s3Endpoint.Text, _s3Region.Text, keyId, secret);
-            var listing = await Task.Run(() => client.ListAsync(bucket, "", CancellationToken.None));
-            _s3Info.Text = $"Подключение успешно. Папок в бакете: {listing.Folders.Count}.";
-        }
-        catch (Exception ex)
-        {
-            _s3Info.Text = "Не получилось: " + ex.Message;
-        }
-        finally
-        {
-            _s3Test.Enabled = true;
-        }
+            page.Controls.Add(new Label { Text = hint, Left = 360, Top = top + 3, AutoSize = true, ForeColor = SystemColors.GrayText });
     }
 
     private void OnOk()
@@ -390,6 +325,15 @@ internal sealed class SettingsDialog : Form
             return;
         }
 
+        var a = _s3a.ToSettings();
+        var b = _s3b.ToSettings();
+        if (a is not null && b is not null && string.Equals(a.Bucket, b.Bucket, StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, "В обоих бакетах указано одно и то же имя. Для второго бакета введите другое имя или очистите поле.",
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         _s.CacheDir = cache;
         _s.HistoryDir = hist;
         _s.DeleteDownloaded = _delete.Checked;
@@ -398,11 +342,182 @@ internal sealed class SettingsDialog : Form
         _s.GeoDropPercent = (double)_geoDrop.Value;
         _s.TimezoneHours = (int)_tz.Value;
 
-        _s.S3.Endpoint = string.IsNullOrWhiteSpace(_s3Endpoint.Text) ? "storage.yandexcloud.net" : _s3Endpoint.Text.Trim();
-        _s.S3.Region = string.IsNullOrWhiteSpace(_s3Region.Text) ? "ru-central1" : _s3Region.Text.Trim();
-        _s.S3.Bucket = _s3Bucket.Text.Trim();
-        _s.S3.AccessKeyId = _s3Key.Text.Trim();
-        if (_s3Secret.Text.Length > 0) _s.S3.SetSecret(_s3Secret.Text);
+        var list = new List<S3Settings>();
+        if (a is not null) list.Add(a);
+        if (b is not null) list.Add(b);
+        _s.S3Connections = list;
+        DialogResult = DialogResult.OK;
+    }
+}
+
+/// <summary>Поля одного подключения к S3 на вкладке настроек.</summary>
+internal sealed class S3Editor
+{
+    private readonly TextBox _endpoint = new();
+    private readonly TextBox _region = new();
+    private readonly TextBox _bucket = new();
+    private readonly TextBox _keyId = new();
+    private readonly TextBox _secret = new() { UseSystemPasswordChar = true };
+    private readonly Button _test = new() { Text = "Проверить подключение" };
+    private readonly Label _info = new() { AutoSize = true, MaximumSize = new Size(600, 0) };
+    private readonly S3Settings? _orig;
+    private readonly Func<string, string>? _borrowSecret;
+
+    public S3Editor(TabPage page, S3Settings? existing, S3Settings? prefillFrom, Func<string, string>? borrowSecret, string description)
+    {
+        _orig = existing;
+        _borrowSecret = borrowSecret;
+        var defaults = new S3Settings();
+
+        page.Controls.Add(new Label { Text = description, Left = 12, Top = 10, AutoSize = true, MaximumSize = new Size(610, 0), ForeColor = SystemColors.GrayText });
+        AddRow(page, "Адрес сервиса:", _endpoint, 58);
+        AddRow(page, "Регион:", _region, 90);
+        AddRow(page, "Бакет:", _bucket, 122);
+        AddRow(page, "Идентификатор ключа:", _keyId, 154);
+        AddRow(page, "Секретный ключ:", _secret, 186);
+        _test.SetBounds(200, 226, 190, 28);
+        page.Controls.Add(_test);
+        _info.Location = new Point(12, 266);
+        page.Controls.Add(_info);
+
+        _endpoint.Text = existing?.Endpoint ?? prefillFrom?.Endpoint ?? defaults.Endpoint;
+        _region.Text = existing?.Region ?? prefillFrom?.Region ?? defaults.Region;
+        _bucket.Text = existing?.Bucket ?? "";
+        _keyId.Text = existing?.AccessKeyId ?? prefillFrom?.AccessKeyId ?? "";
+        if (!string.IsNullOrEmpty(existing?.SecretKeyEncrypted))
+            _info.Text = "Секретный ключ сохранён (в зашифрованном виде). Оставьте поле пустым, чтобы не менять его.";
+
+        _test.Click += async (_, _) => await TestAsync();
+    }
+
+    private static void AddRow(Control page, string caption, TextBox box, int y)
+    {
+        page.Controls.Add(new Label { Text = caption, Left = 12, Top = y + 4, AutoSize = true });
+        box.SetBounds(200, y, 410, 24);
+        page.Controls.Add(box);
+    }
+
+    /// <summary>Введённый секретный ключ, либо сохранённый (если идентификатор не менялся), либо взятый у первого бакета.</summary>
+    public string EffectiveSecret(string keyId)
+    {
+        if (_secret.Text.Length > 0) return _secret.Text;
+        if (_orig is not null && _orig.AccessKeyId == keyId) return _orig.GetSecret();
+        return _borrowSecret?.Invoke(keyId) ?? "";
+    }
+
+    private string EffectiveSecret() => EffectiveSecret(_keyId.Text.Trim());
+
+    /// <summary>Подключение из введённых полей; null — если бакет не указан (вкладка не используется).</summary>
+    public S3Settings? ToSettings()
+    {
+        string bucket = _bucket.Text.Trim();
+        if (bucket.Length == 0) return null;
+        var s = new S3Settings
+        {
+            Endpoint = string.IsNullOrWhiteSpace(_endpoint.Text) ? "storage.yandexcloud.net" : _endpoint.Text.Trim(),
+            Region = string.IsNullOrWhiteSpace(_region.Text) ? "ru-central1" : _region.Text.Trim(),
+            Bucket = bucket,
+            AccessKeyId = _keyId.Text.Trim(),
+        };
+        string secret = EffectiveSecret(s.AccessKeyId);
+        if (secret.Length > 0) s.SetSecret(secret);
+        return s;
+    }
+
+    private async Task TestAsync()
+    {
+        string bucket = _bucket.Text.Trim();
+        string keyId = _keyId.Text.Trim();
+        string secret = EffectiveSecret();
+        if (bucket.Length == 0 || keyId.Length == 0 || secret.Length == 0)
+        {
+            _info.Text = "Заполните бакет, идентификатор и секретный ключ.";
+            return;
+        }
+
+        _test.Enabled = false;
+        _info.Text = "Проверяю подключение…";
+        try
+        {
+            var client = new S3Client(_endpoint.Text, _region.Text, keyId, secret);
+            var listing = await Task.Run(() => client.ListAsync(bucket, "", CancellationToken.None));
+            _info.Text = $"Подключение успешно. Папок в бакете: {listing.Folders.Count}.";
+        }
+        catch (Exception ex)
+        {
+            _info.Text = "Не получилось: " + ex.Message;
+        }
+        finally
+        {
+            _test.Enabled = true;
+        }
+    }
+}
+
+/// <summary>Добавление S3-папки в сеть: выбор бакета и имя папки (или полный адрес s3://…).</summary>
+internal sealed class S3AddDialog : Form
+{
+    private readonly ComboBox _bucket = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly TextBox _folder = new();
+
+    public string? Result { get; private set; }
+
+    public S3AddDialog(List<string> buckets)
+    {
+        Text = "Добавить S3-папку";
+        Font = new Font("Segoe UI", 9F);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowInTaskbar = false;
+        ClientSize = new Size(540, 170);
+
+        Controls.Add(new Label { Text = "Бакет:", Left = 12, Top = 14, AutoSize = true });
+        _bucket.SetBounds(12, 34, 516, 24);
+        foreach (var b in buckets) _bucket.Items.Add(b);
+        if (_bucket.Items.Count > 0) _bucket.SelectedIndex = 0;
+        Controls.Add(_bucket);
+
+        Controls.Add(new Label
+        {
+            Text = "Папка в бакете (например: winelab/) или полный адрес вида s3://бакет/папка/",
+            Left = 12, Top = 70, AutoSize = true,
+        });
+        _folder.SetBounds(12, 92, 516, 24);
+        Controls.Add(_folder);
+
+        var ok = new Button { Text = "Добавить", Left = 372, Top = 128, Width = 75 };
+        var cancel = new Button { Text = "Отмена", Left = 453, Top = 128, Width = 75, DialogResult = DialogResult.Cancel };
+        Controls.AddRange(new Control[] { ok, cancel });
+        AcceptButton = ok;
+        CancelButton = cancel;
+        ok.Click += (_, _) => OnOk();
+    }
+
+    private void OnOk()
+    {
+        string text = _folder.Text.Trim();
+        if (text.Length == 0)
+        {
+            MessageBox.Show(this, "Введите папку или адрес.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string value = text;
+        if (!value.StartsWith("s3://", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_bucket.SelectedItem is not string bucket)
+            {
+                MessageBox.Show(this, "Бакеты не настроены. Укажите их в «Настройках» или введите полный адрес s3://бакет/папка/",
+                    Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            value = $"s3://{bucket}/{text.Trim('/')}/";
+        }
+
+        if (!value.EndsWith('/') && !value.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) value += "/";
+        Result = value;
         DialogResult = DialogResult.OK;
     }
 }
@@ -411,11 +526,13 @@ internal sealed class SettingsDialog : Form
 internal sealed class S3ImportDialog : Form
 {
     private readonly CheckedListBox _list = new() { CheckOnClick = true, IntegralHeight = false };
+    private readonly List<(string Bucket, string Folder)> _items;
 
-    public List<string> Selected { get; } = new();
+    public List<(string Bucket, string Folder)> Selected { get; } = new();
 
-    public S3ImportDialog(string bucket, List<string> folders, int alreadyAdded)
+    public S3ImportDialog(List<(string Bucket, string Folder)> items, int alreadyAdded, string? warning)
     {
+        _items = items;
         Text = "Сети из S3";
         Font = new Font("Segoe UI", 9F);
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -423,23 +540,26 @@ internal sealed class S3ImportDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(520, 460);
+        ClientSize = new Size(560, 500);
 
         string note = alreadyAdded > 0 ? $"  (уже добавлено ранее: {alreadyAdded})" : "";
         Controls.Add(new Label
         {
-            Text = $"Папки бакета «{bucket}». Каждая отмеченная станет отдельной сетью.{note}",
-            Left = 12, Top = 12, AutoSize = true, MaximumSize = new Size(496, 0),
+            Text = "Каждая отмеченная папка станет отдельной сетью." + note,
+            Left = 12, Top = 12, AutoSize = true, MaximumSize = new Size(536, 0),
         });
 
-        _list.SetBounds(12, 52, 496, 340);
-        foreach (var f in folders) _list.Items.Add(f, true);
+        _list.SetBounds(12, 40, 536, 340);
+        foreach (var (bucket, folder) in items) _list.Items.Add($"{bucket}  /  {folder}", true);
         Controls.Add(_list);
 
-        var all = new Button { Text = "Отметить все", Left = 12, Top = 400, Width = 110 };
-        var none = new Button { Text = "Снять все", Left = 128, Top = 400, Width = 110 };
-        var ok = new Button { Text = "Добавить сети", Left = 304, Top = 422, Width = 112 };
-        var cancel = new Button { Text = "Отмена", Left = 422, Top = 422, Width = 86, DialogResult = DialogResult.Cancel };
+        if (!string.IsNullOrEmpty(warning))
+            Controls.Add(new Label { Text = warning, Left = 12, Top = 386, AutoSize = true, MaximumSize = new Size(536, 0), ForeColor = Color.Firebrick });
+
+        var all = new Button { Text = "Отметить все", Left = 12, Top = 460, Width = 110 };
+        var none = new Button { Text = "Снять все", Left = 128, Top = 460, Width = 110 };
+        var ok = new Button { Text = "Добавить сети", Left = 334, Top = 460, Width = 112 };
+        var cancel = new Button { Text = "Отмена", Left = 452, Top = 460, Width = 96, DialogResult = DialogResult.Cancel };
         Controls.AddRange(new Control[] { all, none, ok, cancel });
         AcceptButton = ok;
         CancelButton = cancel;
@@ -449,8 +569,7 @@ internal sealed class S3ImportDialog : Form
         ok.Click += (_, _) =>
         {
             Selected.Clear();
-            foreach (var item in _list.CheckedItems) Selected.Add(item.ToString() ?? "");
-            Selected.RemoveAll(s => s.Length == 0);
+            foreach (int index in _list.CheckedIndices) Selected.Add(_items[index]);
             if (Selected.Count == 0)
             {
                 MessageBox.Show(this, "Отметьте хотя бы одну папку.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);

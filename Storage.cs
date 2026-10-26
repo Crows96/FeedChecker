@@ -60,7 +60,24 @@ public sealed class AppSettings
     /// <summary>Часовой пояс для «сегодня» (UTC+N). 3 — Москва.</summary>
     public int TimezoneHours { get; set; } = 3;
 
-    public S3Settings S3 { get; set; } = new();
+    /// <summary>Подключения к S3 (по одному на бакет). Обычно один или два.</summary>
+    public List<S3Settings> S3Connections { get; set; } = new();
+
+    /// <summary>Старое поле «S3» (один бакет): читается только для переноса в S3Connections и не записывается.</summary>
+    [JsonPropertyName("S3")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public S3Settings? LegacyS3 { get; set; }
+
+    [JsonIgnore]
+    public IEnumerable<S3Settings> ConfiguredS3 =>
+        S3Connections.Where(c => c.IsConfigured && !string.IsNullOrWhiteSpace(c.Bucket));
+
+    /// <summary>Подключение, которое обслуживает указанный бакет.</summary>
+    public S3Settings? FindS3(string bucket) =>
+        ConfiguredS3.FirstOrDefault(c => string.Equals(c.Bucket.Trim(), bucket, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Режим кнопки «Старт»: 0 — все отмеченные, 1 — только непроверенные, 2 — только необновившиеся.</summary>
+    public int RunMode { get; set; }
 
     public string? LastExportDir { get; set; }
     public int WindowWidth { get; set; } = 1250;
@@ -77,9 +94,24 @@ public sealed class AppSettings
         var def = new AppSettings();
         if (string.IsNullOrWhiteSpace(CacheDir)) CacheDir = def.CacheDir;
         if (string.IsNullOrWhiteSpace(HistoryDir)) HistoryDir = def.HistoryDir;
-        S3 ??= new S3Settings();
-        if (string.IsNullOrWhiteSpace(S3.Endpoint)) S3.Endpoint = def.S3.Endpoint;
-        if (string.IsNullOrWhiteSpace(S3.Region)) S3.Region = def.S3.Region;
+        S3Connections ??= new List<S3Settings>();
+        if (LegacyS3 is not null)
+        {
+            if (S3Connections.Count == 0 && (!string.IsNullOrWhiteSpace(LegacyS3.Bucket) || !string.IsNullOrWhiteSpace(LegacyS3.AccessKeyId)))
+                S3Connections.Add(LegacyS3);
+            LegacyS3 = null;
+        }
+        S3Connections.RemoveAll(c => c is null);
+        var s3def = new S3Settings();
+        foreach (var c in S3Connections)
+        {
+            if (string.IsNullOrWhiteSpace(c.Endpoint)) c.Endpoint = s3def.Endpoint;
+            if (string.IsNullOrWhiteSpace(c.Region)) c.Region = s3def.Region;
+            c.Bucket ??= "";
+            c.AccessKeyId ??= "";
+            c.SecretKeyEncrypted ??= "";
+        }
+        RunMode = Math.Clamp(RunMode, 0, 2);
         KeepHistoryDays = Math.Clamp(KeepHistoryDays, 1, 365);
         NetworkTolerancePercent = Math.Clamp(NetworkTolerancePercent, 0, 100);
         GeoDropPercent = Math.Clamp(GeoDropPercent, 0, 100);

@@ -752,8 +752,8 @@ public sealed class RunOptions
     public string CacheDir { get; set; } = Path.Combine(Path.GetTempPath(), "FeedChecker", "cache");
     public bool DeleteDownloaded { get; set; } = true;
     public AnalyzerOptions Analyzer { get; set; } = new();
-    /// <summary>Клиент S3; нужен, если среди источников есть s3://…</summary>
-    public S3Client? S3 { get; set; }
+    /// <summary>Возвращает клиент S3 для бакета (или null, если для него нет ключей). Нужен, если есть источники s3://…</summary>
+    public Func<string, S3Client?>? S3ClientFor { get; set; }
 }
 
 public sealed record RunProgress(int SourceIndex, int SourceCount, string SourceName, string Phase, double Overall);
@@ -781,8 +781,11 @@ public sealed class FeedRunner
             if (!s.IsS3Folder) { work.Add((s, null)); continue; }
             try
             {
-                if (opt.S3 is null) throw new InvalidOperationException("Не заданы ключи доступа S3 (Настройки → S3).");
-                var files = opt.S3.ListFeedSourcesAsync(s.Value, ct).GetAwaiter().GetResult();
+                if (!S3Path.TryParse(s.Value, out var folderBucket, out _))
+                    throw new InvalidOperationException("Неверный адрес S3: " + s.Value);
+                var folderClient = opt.S3ClientFor?.Invoke(folderBucket)
+                    ?? throw new InvalidOperationException($"Для бакета «{folderBucket}» не заданы ключи доступа (Настройки → S3).");
+                var files = folderClient.ListFeedSourcesAsync(s.Value, ct).GetAwaiter().GetResult();
                 if (files.Count == 0) throw new InvalidOperationException("В S3-папке нет файлов .json: " + s.Value);
                 foreach (var f in files) work.Add((f, null));
             }
@@ -830,12 +833,13 @@ public sealed class FeedRunner
                 }
                 else if (src.IsS3)
                 {
-                    if (opt.S3 is null) throw new InvalidOperationException("Не заданы ключи доступа S3 (Настройки → S3).");
                     if (!S3Path.TryParse(src.Value, out var bucket, out var key))
                         throw new InvalidOperationException("Неверный адрес S3: " + src.Value);
+                    var s3Client = opt.S3ClientFor?.Invoke(bucket)
+                        ?? throw new InvalidOperationException($"Для бакета «{bucket}» не заданы ключи доступа (Настройки → S3).");
                     Report("Скачивание", 0);
                     var dl = new Progress<double>(p => Report("Скачивание", p * 0.5));
-                    downloaded = opt.S3.DownloadAsync(bucket, key, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
+                    downloaded = s3Client.DownloadAsync(bucket, key, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
                     path = downloaded;
                     analysisStart = 0.5; analysisSpan = 0.5;
                 }

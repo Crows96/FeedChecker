@@ -23,8 +23,33 @@ public sealed class MetricRow
     public bool HasProblem { get; init; }
 }
 
+/// <summary>Одна строка вкладки «Сравнение по гео»: уникальные офферы магазина/региона сейчас и раньше.</summary>
+public sealed class GeoCompareRow
+{
+    public string Name { get; init; } = "";
+    public long? Current { get; init; }
+    public long? Previous { get; init; }
+    public long? Delta { get; init; }
+    public double? DeltaPercent { get; init; }
+    /// <summary>Среднее за период (считается, если в истории не меньше двух проверок с этим гео).</summary>
+    public double? Average { get; init; }
+    /// <summary>OK, Падение, Рост, Новое, Пропало или «нет истории».</summary>
+    public string Status { get; init; } = "";
+
+    public static int StatusOrder(string status) => status switch
+    {
+        "Пропало" => 0,
+        "Падение" => 1,
+        "Новое" => 2,
+        "Рост" => 3,
+        "OK" => 4,
+        _ => 5,
+    };
+}
+
 public sealed class ComparisonResult
 {
+    public List<GeoCompareRow> GeoRows { get; } = new();
     public RunRecord? Previous { get; set; }
     /// <summary>По скольким проверкам посчитано среднее.</summary>
     public int AverageCount { get; set; }
@@ -144,6 +169,63 @@ public static class RunComparer
             }
         }
 
+        // уникальные офферы по каждому гео: сейчас / прошлая проверка / среднее за период
+        var prevByName = prev is null
+            ? new Dictionary<string, GeoRecord>(StringComparer.Ordinal)
+            : prev.Geos.GroupBy(g => g.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+
+        var avgByName = new Dictionary<string, double>(StringComparer.Ordinal);
+        if (avgSet.Count >= 2)
+        {
+            var acc = new Dictionary<string, (double Sum, int Count)>(StringComparer.Ordinal);
+            foreach (var rec in avgSet)
+                foreach (var g in rec.Geos)
+                {
+                    acc.TryGetValue(g.Name, out var a);
+                    acc[g.Name] = (a.Sum + g.UniqueProducts, a.Count + 1);
+                }
+            foreach (var (name, a) in acc)
+                if (a.Count >= 2) avgByName[name] = a.Sum / a.Count;
+        }
+
+        GeoCompareRow MakeRow(string name, long? now, long? before)
+        {
+            double? pct = Pct(now ?? 0, before);
+            string status;
+            if (prev is null) status = "нет истории";
+            else if (now is null) status = "Пропало";
+            else if (before is null) status = "Новое";
+            else if (pct is { } down && down < 0 && down <= -s.GeoDropPercent) status = "Падение";
+            else if (pct is { } up && up > 0 && up >= s.GeoDropPercent) status = "Рост";
+            else status = "OK";
+
+            return new GeoCompareRow
+            {
+                Name = name,
+                Current = now,
+                Previous = before,
+                Delta = before is null ? null : (now ?? 0) - before.Value,
+                DeltaPercent = pct is { } p && !double.IsInfinity(p) ? p : null,
+                Average = avgByName.TryGetValue(name, out var av) ? av : null,
+                Status = status,
+            };
+        }
+
+        var rows = new List<GeoCompareRow>();
+        var curNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var g in cur.Geos)
+        {
+            curNames.Add(g.Name);
+            rows.Add(MakeRow(g.Name, g.UniqueProducts, prevByName.TryGetValue(g.Name, out var old) ? old.UniqueProducts : null));
+        }
+        foreach (var g in prevByName.Values)
+            if (!curNames.Contains(g.Name)) rows.Add(MakeRow(g.Name, null, g.UniqueProducts));
+
+        res.GeoRows.AddRange(rows
+            .OrderBy(x => GeoCompareRow.StatusOrder(x.Status))
+            .ThenBy(x => x.DeltaPercent ?? 0)
+            .ThenBy(x => x.Name, StringComparer.CurrentCulture));
+
         return res;
     }
 
@@ -194,7 +276,7 @@ public static class NetworkChecker
         {
             CacheDir = settings.CacheDir,
             DeleteDownloaded = settings.DeleteDownloaded,
-            S3 = settings.S3.IsConfigured ? S3Client.FromSettings(settings.S3) : null,
+            S3ClientFor = bucket => settings.FindS3(bucket) is { } conn ? S3Client.FromSettings(conn) : null,
         };
         var sources = net.Sources.Select(v => new FeedSource(v)).ToList();
         var run = new FeedRunner().Run(sources, net.Name, options, progress, null, ct);

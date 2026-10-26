@@ -24,12 +24,14 @@ public sealed class MainForm : Form
     private readonly Button _btnStart = new() { Text = "▶ Старт", AutoSize = true };
     private readonly Button _btnStop = new() { Text = "■ Стоп", AutoSize = true };
     private readonly Button _btnAddNet = new() { Text = "＋ Сеть…", AutoSize = true };
+    private readonly ComboBox _mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
+    private readonly Button _btnSave = new() { Text = "Сохранить ▾", AutoSize = true };
+    private CheckState _headerState = CheckState.Unchecked;
+    private bool _loaded; // окно уже показано (до этого список ещё создаёт своё окно и шлёт служебные события)
     private readonly Button _btnImportS3 = new() { Text = "Сети из S3…", AutoSize = true };
     private readonly Button _btnEditNet = new() { Text = "Изменить…", AutoSize = true };
     private readonly Button _btnDelNet = new() { Text = "Удалить", AutoSize = true };
     private readonly Button _btnSettings = new() { Text = "Настройки…", AutoSize = true };
-    private readonly Button _btnExportGeo = new() { Text = "Выгрузить гео…", AutoSize = true };
-    private readonly Button _btnReport = new() { Text = "Сохранить отчёт…", AutoSize = true };
 
     private readonly ListView _list = new();
     private readonly Label _fresh = new();
@@ -39,6 +41,10 @@ public sealed class MainForm : Form
     private readonly TabPage _tabIssues = new("Ошибки и предупреждения");
     private readonly TextBox _summary = new();
     private readonly DataGridView _gridCompare = MakeGrid();
+    private readonly TabPage _tabGeoCmp = new("Сравнение по гео");
+    private readonly DataGridView _gridGeoCmp = MakeGrid();
+    private readonly CheckBox _chkOnlyDiffs = new() { Text = "Только расхождения", AutoSize = true };
+    private readonly Label _lblGeoCmp = new() { AutoSize = true };
     private readonly DataGridView _gridIssues = MakeGrid();
     private readonly DataGridView _gridGeo = MakeGrid();
     private readonly ProgressBar _progress = new();
@@ -90,6 +96,15 @@ public sealed class MainForm : Form
         var bar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(6) };
         _btnStart.Font = new Font(Font, FontStyle.Bold);
         _btnStop.Font = new Font(Font, FontStyle.Bold);
+        _mode.Items.AddRange(new object[] { "Все отмеченные сети", "Только непроверенные", "Только необновившиеся" });
+        _mode.SelectedIndex = Math.Clamp(Settings.RunMode, 0, 2);
+        _mode.Margin = new Padding(3, 5, 12, 3);
+        _tip.SetToolTip(_mode,
+            "Все отмеченные сети — проверить каждую сеть с галочкой.\n" +
+            "Только непроверенные — пропустить сети, уже успешно проверенные сегодня.\n" +
+            "Только необновившиеся — только сети, у которых date_start не сегодняшний.");
+        bar.Controls.Add(new Label { Text = "Режим:", AutoSize = true, Margin = new Padding(3, 8, 3, 0) });
+        bar.Controls.Add(_mode);
         bar.Controls.Add(_btnStart);
         bar.Controls.Add(_btnStop);
         _btnAddNet.Margin = new Padding(24, 3, 3, 3);
@@ -97,10 +112,10 @@ public sealed class MainForm : Form
         bar.Controls.Add(_btnImportS3);
         bar.Controls.Add(_btnEditNet);
         bar.Controls.Add(_btnDelNet);
+        _btnSettings.Margin = new Padding(24, 3, 3, 3);
         bar.Controls.Add(_btnSettings);
-        _btnExportGeo.Margin = new Padding(24, 3, 3, 3);
-        bar.Controls.Add(_btnExportGeo);
-        bar.Controls.Add(_btnReport);
+        _btnSave.Margin = new Padding(24, 3, 3, 3);
+        bar.Controls.Add(_btnSave);
 
         // список сетей
         _list.Dock = DockStyle.Fill;
@@ -110,22 +125,29 @@ public sealed class MainForm : Form
         _list.MultiSelect = false;
         _list.CheckBoxes = true;
         _list.GridLines = true;
-        _list.Columns.Add("Сеть", 170);
-        _list.Columns.Add("Источн.", 60);
-        _list.Columns.Add("Статус", 105);
-        _list.Columns.Add("date_start", 85);
-        _list.Columns.Add("Свежесть", 125);
-        _list.Columns.Add("Проверено", 100);
+        _list.Columns.Add("Сеть", 150);
+        _list.Columns.Add("Источн.", 55);
+        _list.Columns.Add("Статус", 100);
+        _list.Columns.Add("date_start", 80);
+        _list.Columns.Add("Свежесть", 115);
+        _list.Columns.Add("Проверено", 90);
+        _list.ClientSizeChanged += (_, _) => FitNetworkColumn();
+        _list.ColumnWidthChanged += (_, e) => { if (e.ColumnIndex != 0) FitNetworkColumn(); };
+        _list.OwnerDraw = true; // нужно только ради галочки в заголовке «Сеть»; всё остальное рисуется как обычно
+        _list.DrawColumnHeader += OnDrawColumnHeader;
+        _list.DrawItem += (_, e) => e.DrawDefault = true;
+        _list.DrawSubItem += (_, e) => e.DrawDefault = true;
 
         _fresh.Dock = DockStyle.Fill;
         _fresh.AutoSize = true;
-        _fresh.Padding = new Padding(4, 6, 4, 6);
+        _fresh.Padding = new Padding(16, 0, 4, 0);
         _fresh.Font = new Font(Font, FontStyle.Bold);
-        var left = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
-        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        left.Controls.Add(_list, 0, 0);
-        left.Controls.Add(_fresh, 0, 1);
+
+        // слева такая же вкладка, как справа: верхние и нижние края обеих частей совпадают по высоте
+        var leftTabs = new TabControl { Dock = DockStyle.Fill };
+        var tabNets = new TabPage("Сети");
+        tabNets.Controls.Add(_list);
+        leftTabs.TabPages.Add(tabNets);
 
         // результаты
         _tabs.Dock = DockStyle.Fill;
@@ -143,18 +165,43 @@ public sealed class MainForm : Form
         var tabGeo = new TabPage("Гео");
         tabGeo.Controls.Add(_gridGeo);
         _tabs.TabPages.Add(tabSummary);
+        var geoCmpLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        geoCmpLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        geoCmpLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var geoCmpBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Padding = new Padding(4, 4, 4, 0) };
+        _chkOnlyDiffs.Margin = new Padding(3, 3, 18, 3);
+        _lblGeoCmp.Margin = new Padding(3, 5, 3, 3);
+        geoCmpBar.Controls.Add(_chkOnlyDiffs);
+        geoCmpBar.Controls.Add(_lblGeoCmp);
+        geoCmpLayout.Controls.Add(geoCmpBar, 0, 0);
+        geoCmpLayout.Controls.Add(_gridGeoCmp, 0, 1);
+        _tabGeoCmp.Controls.Add(geoCmpLayout);
         _tabs.TabPages.Add(tabCompare);
+        _tabs.TabPages.Add(_tabGeoCmp);
         _tabs.TabPages.Add(_tabIssues);
         _tabs.TabPages.Add(tabGeo);
 
         _split.Dock = DockStyle.Fill;
         _split.Orientation = Orientation.Vertical;
-        _split.Panel1.Controls.Add(left);
+        _split.Panel1.Controls.Add(leftTabs);
         _split.Panel2.Controls.Add(_tabs);
         Load += (_, _) =>
         {
-            int max = Math.Max(150, _split.Width - 250);
-            _split.SplitterDistance = Math.Clamp(Settings.SplitterDistance, 150, max);
+            try
+            {
+                // слева минимум столько, чтобы все столбцы списка влезли без прокрутки; справа остаётся не меньше 380
+                int total = _split.Width, gap = _split.SplitterWidth;
+                int left = Math.Min(620, Math.Max(150, total - 380 - gap));
+                _split.Panel2MinSize = Math.Max(25, Math.Min(380, total - left - gap));
+                _split.Panel1MinSize = left;
+                int max = Math.Max(left, total - _split.Panel2MinSize - gap);
+                _split.SplitterDistance = Math.Clamp(Settings.SplitterDistance, left, max);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                // если окно слишком узкое — оставляем положение по умолчанию
+            }
+            FitNetworkColumn();
         };
 
         // нижняя панель
@@ -166,8 +213,14 @@ public sealed class MainForm : Form
         _status.Dock = DockStyle.Fill;
         _status.AutoSize = true;
         _status.Text = "Добавьте сеть и нажмите «Старт».";
+        // нижняя строка: слева статус, справа «Обновилось сегодня: N из M»
+        var statusRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1 };
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        statusRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        statusRow.Controls.Add(_status, 0, 0);
+        statusRow.Controls.Add(_fresh, 1, 0);
         bottom.Controls.Add(_progress, 0, 0);
-        bottom.Controls.Add(_status, 0, 1);
+        bottom.Controls.Add(statusRow, 0, 1);
 
         root.Controls.Add(bar, 0, 0);
         root.Controls.Add(_split, 0, 1);
@@ -178,6 +231,20 @@ public sealed class MainForm : Form
     private void WireEvents()
     {
         _btnStart.Click += OnStart;
+        _mode.SelectedIndexChanged += (_, _) =>
+        {
+            Settings.RunMode = Math.Max(0, _mode.SelectedIndex);
+            SaveStorage();
+        };
+        var saveMenu = new ContextMenuStrip();
+        saveMenu.Items.Add("Выгрузить гео…", null, (_, _) => OnExportGeo());
+        saveMenu.Items.Add("Сохранить отчёт…", null, (_, _) => OnSaveReport());
+        saveMenu.Items.Add("Сохранить ошибки…", null, (_, _) => OnSaveErrors());
+        _btnSave.Click += (_, _) => saveMenu.Show(_btnSave, new Point(0, _btnSave.Height));
+        _list.ColumnClick += (_, e) =>
+        {
+            if (e.Column == 0) SetAllChecked(_headerState != CheckState.Checked);
+        };
         _btnStop.Click += (_, _) =>
         {
             _cts?.Cancel();
@@ -189,18 +256,23 @@ public sealed class MainForm : Form
         _btnEditNet.Click += (_, _) => OnEditNetwork();
         _btnDelNet.Click += (_, _) => OnDeleteNetwork();
         _btnSettings.Click += (_, _) => OnSettings();
-        _btnExportGeo.Click += (_, _) => OnExportGeo();
-        _btnReport.Click += (_, _) => OnSaveReport();
 
         _list.SelectedIndexChanged += (_, _) => ShowSelected();
         _list.DoubleClick += (_, _) => { if (_btnEditNet.Enabled) OnEditNetwork(); };
+        Shown += (_, _) =>
+        {
+            _loaded = true;
+            UpdateHeaderCheck();
+        };
         _list.ItemChecked += (_, e) =>
         {
-            if (_populating) return;
+            // при создании окна списка WinForms сам «пересоздаёт» строки и шлёт ItemChecked — их игнорируем
+            if (_populating || !_loaded) return;
             var net = _storage.Networks.FirstOrDefault(n => n.Id == (string)e.Item.Tag!);
             if (net is null) return;
             net.Enabled = e.Item.Checked;
             SaveStorage();
+            UpdateHeaderCheck();
         };
 
         _gridCompare.CellFormatting += (_, e) =>
@@ -208,6 +280,14 @@ public sealed class MainForm : Form
             if (e.CellStyle is null || e.RowIndex < 0 || e.RowIndex >= _gridCompare.Rows.Count) return;
             var status = _gridCompare.Rows[e.RowIndex].Cells[6].Value as string;
             if (status is not null && status != "OK" && status != "нет истории") e.CellStyle.BackColor = Caution;
+        };
+        _chkOnlyDiffs.CheckedChanged += (_, _) => ApplyGeoCmpFilter();
+        _gridGeoCmp.CellFormatting += (_, e) =>
+        {
+            if (e.CellStyle is null || e.RowIndex < 0 || e.RowIndex >= _gridGeoCmp.Rows.Count) return;
+            var status = _gridGeoCmp.Rows[e.RowIndex].Cells[6].Value as string;
+            if (status is "Пропало" or "Падение") e.CellStyle.BackColor = Bad;
+            else if (status is "Новое" or "Рост") e.CellStyle.BackColor = Caution;
         };
         _gridIssues.CellFormatting += (_, e) =>
         {
@@ -226,6 +306,7 @@ public sealed class MainForm : Form
     private void SetRunning(bool running)
     {
         _btnStart.Enabled = !running;
+        _mode.Enabled = !running;
         _btnStop.Enabled = running;
         _btnAddNet.Enabled = !running;
         _btnImportS3.Enabled = !running;
@@ -307,6 +388,8 @@ public sealed class MainForm : Form
         _populating = false;
 
         if (_list.SelectedItems.Count == 0 && _list.Items.Count > 0) _list.Items[0].Selected = true;
+        UpdateHeaderCheck();
+        FitNetworkColumn();
         UpdateFreshLabel();
         ShowSelected();
     }
@@ -349,11 +432,80 @@ public sealed class MainForm : Form
         _tip.SetToolTip(_fresh, late.Count == 0 ? "" : "Не обновились: " + string.Join(", ", late));
     }
 
+    private void SetAllChecked(bool value)
+    {
+        _populating = true; // чтобы не сохранять настройки после каждой галочки
+        foreach (ListViewItem item in _list.Items)
+        {
+            item.Checked = value;
+            var net = _storage.Networks.FirstOrDefault(n => n.Id == (string)item.Tag!);
+            if (net is not null) net.Enabled = value;
+        }
+        _populating = false;
+        SaveStorage();
+        UpdateHeaderCheck();
+    }
+
+    private bool _fitting;
+
+    /// <summary>Столбец «Сеть» растягивается на всю свободную ширину списка, поэтому горизонтальной прокрутки нет.</summary>
+    private void FitNetworkColumn()
+    {
+        if (_fitting || _list.Columns.Count == 0) return;
+        _fitting = true;
+        try
+        {
+            int others = 0;
+            for (int i = 1; i < _list.Columns.Count; i++) others += _list.Columns[i].Width;
+            _list.Columns[0].Width = Math.Max(130, _list.ClientSize.Width - others);
+        }
+        finally
+        {
+            _fitting = false;
+        }
+    }
+
+    private void UpdateHeaderCheck()
+    {
+        int total = _list.Items.Count;
+        int on = _list.Items.Cast<ListViewItem?>().Count(i => i is not null && i.Checked);
+        _headerState = total == 0 || on == 0 ? CheckState.Unchecked
+            : on == total ? CheckState.Checked
+            : CheckState.Indeterminate;
+        _list.Columns[0].Text = _list.Columns[0].Text; // заставляет заголовок перерисоваться
+        _list.Invalidate(true);
+    }
+
+    private void OnDrawColumnHeader(object? sender, DrawListViewColumnHeaderEventArgs e)
+    {
+        if (e.ColumnIndex != 0)
+        {
+            e.DrawDefault = true;
+            return;
+        }
+
+        e.DrawBackground();
+        var state = _headerState switch
+        {
+            CheckState.Checked => System.Windows.Forms.VisualStyles.CheckBoxState.CheckedNormal,
+            CheckState.Indeterminate => System.Windows.Forms.VisualStyles.CheckBoxState.MixedNormal,
+            _ => System.Windows.Forms.VisualStyles.CheckBoxState.UncheckedNormal,
+        };
+        var glyph = CheckBoxRenderer.GetGlyphSize(e.Graphics, state);
+        var point = new Point(e.Bounds.Left + 4, e.Bounds.Top + (e.Bounds.Height - glyph.Height) / 2);
+        CheckBoxRenderer.DrawCheckBox(e.Graphics, point, state);
+
+        var textRect = new Rectangle(e.Bounds.Left + glyph.Width + 10, e.Bounds.Top,
+            Math.Max(0, e.Bounds.Width - glyph.Width - 14), e.Bounds.Height);
+        TextRenderer.DrawText(e.Graphics, "Сеть", _list.Font, textRect, SystemColors.ControlText,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+    }
+
     // ------------------------------------------------------------------ сети: добавить, изменить, удалить
 
     private void OnAddNetwork()
     {
-        using var dlg = new NetworkDialog(null, _storage.Networks.Select(n => n.Name).ToList(), Settings.S3.Bucket);
+        using var dlg = new NetworkDialog(null, _storage.Networks.Select(n => n.Name).ToList(), Settings.ConfiguredS3.Select(c => c.Bucket).ToList());
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         _storage.Networks.Add(dlg.Result);
         SaveStorage();
@@ -365,7 +517,7 @@ public sealed class MainForm : Form
         var net = Selected();
         if (net is null) return;
         var others = _storage.Networks.Where(n => n.Id != net.Id).Select(n => n.Name).ToList();
-        using var dlg = new NetworkDialog(net.Clone(), others, Settings.S3.Bucket);
+        using var dlg = new NetworkDialog(net.Clone(), others, Settings.ConfiguredS3.Select(c => c.Bucket).ToList());
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         int index = _storage.Networks.FindIndex(n => n.Id == net.Id);
@@ -394,8 +546,8 @@ public sealed class MainForm : Form
 
     private async void OnImportFromS3()
     {
-        var s3 = Settings.S3;
-        if (!s3.IsConfigured || string.IsNullOrWhiteSpace(s3.Bucket))
+        var conns = Settings.ConfiguredS3.ToList();
+        if (conns.Count == 0)
         {
             MessageBox.Show(this, "Сначала заполните раздел S3 в «Настройках»: бакет, идентификатор и секретный ключ.",
                 Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -406,32 +558,52 @@ public sealed class MainForm : Form
         _status.Text = "Получаю список папок в S3…";
         try
         {
-            var client = S3Client.FromSettings(s3);
-            var listing = await Task.Run(() => client.ListAsync(s3.Bucket, "", CancellationToken.None));
+            var found = new List<(string Bucket, string Folder)>();
+            var errors = new List<string>();
+            foreach (var c in conns)
+            {
+                try
+                {
+                    var client = S3Client.FromSettings(c);
+                    var listing = await Task.Run(() => client.ListAsync(c.Bucket, "", CancellationToken.None));
+                    foreach (var f in listing.Folders) found.Add((c.Bucket, f));
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{c.Bucket}: {ex.Message}");
+                }
+            }
+
+            if (found.Count == 0 && errors.Count > 0) throw new InvalidOperationException(string.Join("\n", errors));
 
             var used = new HashSet<string>(_storage.Networks.SelectMany(n => n.Sources), StringComparer.OrdinalIgnoreCase);
-            var folders = listing.Folders.Where(f => !used.Contains($"s3://{s3.Bucket}/{f}")).ToList();
-            int already = listing.Folders.Count - folders.Count;
-            if (folders.Count == 0)
+            var fresh = found.Where(x => !used.Contains($"s3://{x.Bucket}/{x.Folder}")).ToList();
+            int already = found.Count - fresh.Count;
+            if (fresh.Count == 0)
             {
                 MessageBox.Show(this,
-                    listing.Folders.Count == 0 ? "В бакете нет папок." : "Все папки бакета уже добавлены как сети.",
+                    found.Count == 0 ? "В бакетах нет папок." : "Все папки бакетов уже добавлены как сети.",
                     Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 _status.Text = "Новых папок в S3 нет.";
                 return;
             }
 
-            using var dlg = new S3ImportDialog(s3.Bucket, folders, already);
+            using var dlg = new S3ImportDialog(fresh, already, errors.Count == 0 ? null : "Не удалось прочитать: " + string.Join("; ", errors));
             if (dlg.ShowDialog(this) != DialogResult.OK) { _status.Text = ""; return; }
 
             var names = new HashSet<string>(_storage.Networks.Select(n => n.Name), StringComparer.CurrentCultureIgnoreCase);
             string? lastId = null;
-            foreach (var folder in dlg.Selected)
+            foreach (var (bucket, folder) in dlg.Selected)
             {
                 string baseName = folder.TrimEnd('/');
                 string name = baseName;
-                for (int k = 2; !names.Add(name); k++) name = $"{baseName} ({k})";
-                var net = new NetworkConfig { Name = name, Sources = { $"s3://{s3.Bucket}/{folder}" } };
+                if (!names.Add(name))
+                {
+                    name = $"{baseName} ({bucket})";
+                    for (int k = 2; !names.Add(name); k++) name = $"{baseName} ({bucket}) {k}";
+                }
+
+                var net = new NetworkConfig { Name = name, Sources = { $"s3://{bucket}/{folder}" } };
                 _storage.Networks.Add(net);
                 lastId = net.Id;
             }
@@ -484,13 +656,56 @@ public sealed class MainForm : Form
 
     private async void OnStart(object? sender, EventArgs e)
     {
-        var nets = _storage.Networks.Where(n => n.Enabled).ToList();
-        if (nets.Count == 0)
+        switch (_mode.SelectedIndex)
+        {
+            case 1:
+                await StartRunAsync(n => !CheckedToday(n), "Все отмеченные сети уже проверены сегодня — проверять нечего.");
+                break;
+            case 2:
+                await StartRunAsync(NotFreshToday, "У всех отмеченных сетей date_start уже сегодняшний — перепроверять нечего.");
+                break;
+            default:
+                await StartRunAsync(_ => true, null);
+                break;
+        }
+    }
+
+    /// <summary>Сеть уже успешно проверена сегодня: в этой сессии либо (после перезапуска) по записи истории.</summary>
+    private bool CheckedToday(NetworkConfig n)
+    {
+        if (_results.TryGetValue(n.Id, out var r))
+            return r.Run is { Cancelled: false } run && run.Files.Count > 0 && run.Files.All(f => f.IsValid);
+
+        return _lastRecords.TryGetValue(n.Id, out var rec) && rec is not null &&
+               DateOnly.FromDateTime(rec.TimestampUtc.AddHours(Settings.TimezoneHours)) == Settings.Today();
+    }
+
+    /// <summary>date_start сети не сегодняшний (или неизвестен).</summary>
+    private bool NotFreshToday(NetworkConfig n)
+    {
+        DateOnly? date = null;
+        if (_results.TryGetValue(n.Id, out var r) && r.Run is not null) date = r.Run.Summary.DateStartMax;
+        else if (_lastRecords.TryGetValue(n.Id, out var rec)) date = rec?.DateStartMax;
+        return date != Settings.Today();
+    }
+
+    private async Task StartRunAsync(Func<NetworkConfig, bool> filter, string? nothingToDo)
+    {
+        var ticked = _storage.Networks.Where(n => n.Enabled).ToList();
+        if (ticked.Count == 0)
         {
             MessageBox.Show(this, "Отметьте галочкой сети, которые нужно проверить (или сначала добавьте сеть).",
                 Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+
+        var nets = ticked.Where(filter).ToList();
+        if (nets.Count == 0)
+        {
+            MessageBox.Show(this, nothingToDo ?? "Нечего проверять.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        int skipped = ticked.Count - nets.Count;
 
         foreach (var n in nets)
         {
@@ -527,7 +742,8 @@ public sealed class MainForm : Form
             _progress.Value = token.IsCancellationRequested ? _progress.Value : _progress.Maximum;
             _status.Text = token.IsCancellationRequested
                 ? "Остановлено."
-                : $"Готово. Проверено сетей: {nets.Count}. {_fresh.Text}.";
+                : $"Готово. Проверено сетей: {nets.Count}" +
+                  (skipped > 0 ? $" (пропущено уже проверенных: {skipped})" : "") + $". {_fresh.Text}.";
         }
         catch (Exception ex)
         {
@@ -574,6 +790,7 @@ public sealed class MainForm : Form
     {
         _summary.Clear();
         _gridCompare.DataSource = null;
+        ClearGeoComparison();
         _gridIssues.DataSource = null;
         _gridGeo.DataSource = null;
         _shownGeos = new List<GeoRow>();
@@ -591,6 +808,7 @@ public sealed class MainForm : Form
         {
             _summary.Text = BuildSummary(net, r);
             FillComparison(r.Comparison);
+            FillGeoComparison(r.Comparison);
             FillIssues(r);
             SetGeos(r.Run.Summary.Geos);
             return;
@@ -598,6 +816,7 @@ public sealed class MainForm : Form
 
         // в этой сессии проверка не запускалась — показываем последнюю сохранённую из истории
         _gridCompare.DataSource = null;
+        ClearGeoComparison();
         _gridIssues.DataSource = null;
         _tabIssues.Text = "Ошибки и предупреждения";
         _lastRecords.TryGetValue(net.Id, out var rec);
@@ -739,6 +958,72 @@ public sealed class MainForm : Form
         _gridCompare.DataSource = table;
     }
 
+    private void ClearGeoComparison()
+    {
+        _gridGeoCmp.DataSource = null;
+        _lblGeoCmp.Text = "";
+        _tabGeoCmp.Text = "Сравнение по гео";
+    }
+
+    private void ApplyGeoCmpFilter()
+    {
+        if (_gridGeoCmp.DataSource is DataTable table)
+            table.DefaultView.RowFilter = _chkOnlyDiffs.Checked ? "[Статус] <> 'OK'" : "";
+    }
+
+    /// <summary>Вкладка «Сравнение по гео»: уникальные офферы каждого магазина/региона сейчас и в прошлой проверке.</summary>
+    private void FillGeoComparison(ComparisonResult? c)
+    {
+        if (c is null || c.GeoRows.Count == 0)
+        {
+            ClearGeoComparison();
+            return;
+        }
+
+        var table = new DataTable();
+        table.Columns.Add("Гео", typeof(string));
+        table.Columns.Add("Уникальных сейчас", typeof(long));
+        table.Columns.Add("Прошлая проверка", typeof(long));
+        table.Columns.Add("Изменение", typeof(long));
+        table.Columns.Add("Изменение, %", typeof(double));
+        table.Columns.Add(c.AverageCount >= 2 ? $"Среднее за {c.KeepDays} дн." : "Среднее за период", typeof(double));
+        table.Columns.Add("Статус", typeof(string));
+        table.BeginLoadData();
+        foreach (var g in c.GeoRows)
+        {
+            table.Rows.Add(g.Name,
+                (object?)g.Current ?? DBNull.Value,
+                (object?)g.Previous ?? DBNull.Value,
+                (object?)g.Delta ?? DBNull.Value,
+                (object?)g.DeltaPercent ?? DBNull.Value,
+                (object?)g.Average ?? DBNull.Value,
+                g.Status);
+        }
+        table.EndLoadData();
+
+        _gridGeoCmp.DataSource = table;
+        if (_gridGeoCmp.Columns.Count >= 7)
+        {
+            _gridGeoCmp.Columns[1].DefaultCellStyle.Format = "N0";
+            _gridGeoCmp.Columns[2].DefaultCellStyle.Format = "N0";
+            _gridGeoCmp.Columns[3].DefaultCellStyle.Format = "+#,0;-#,0;0";
+            _gridGeoCmp.Columns[4].DefaultCellStyle.Format = "+0.0;-0.0;0.0";
+            _gridGeoCmp.Columns[5].DefaultCellStyle.Format = "N1";
+        }
+
+        int removed = c.GeoRows.Count(x => x.Status == "Пропало");
+        int dropped = c.GeoRows.Count(x => x.Status == "Падение");
+        int added = c.GeoRows.Count(x => x.Status == "Новое");
+        int grown = c.GeoRows.Count(x => x.Status == "Рост");
+        int diffs = removed + dropped + added + grown;
+
+        _lblGeoCmp.Text = c.Previous is null
+            ? "Это первая проверка сети: сравнивать пока не с чем."
+            : $"Гео: {c.GeoRows.Count:N0}. Расхождений: {diffs:N0} (пропало {removed}, упало {dropped}, новых {added}, выросло {grown}). Порог: {Settings.GeoDropPercent:0.#}%";
+        _tabGeoCmp.Text = diffs > 0 ? $"Сравнение по гео ({diffs})" : "Сравнение по гео";
+        ApplyGeoCmpFilter();
+    }
+
     private void FillIssues(NetworkCheckResult r)
     {
         const int maxRows = 100_000;
@@ -789,9 +1074,6 @@ public sealed class MainForm : Form
         return s;
     }
 
-    private static string Csv(string s) =>
-        s.IndexOfAny(new[] { ';', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
-
     private string ExportDir() =>
         !string.IsNullOrEmpty(Settings.LastExportDir) && Directory.Exists(Settings.LastExportDir) ? Settings.LastExportDir : "";
 
@@ -807,7 +1089,7 @@ public sealed class MainForm : Form
         using var dlg = new SaveFileDialog
         {
             Title = "Выгрузить гео в файл",
-            Filter = "CSV с цифрами (*.csv)|*.csv|Только названия, по одному в строке (*.txt)|*.txt",
+            Filter = "Excel (*.xlsx)|*.xlsx|CSV для Excel (*.csv)|*.csv|Только названия, по одному в строке (*.txt)|*.txt|JSON (*.json)|*.json",
             FileName = $"{SafeName(_shownNetwork)}_гео_{DateTime.Now:yyyyMMdd}",
             InitialDirectory = ExportDir(),
             AddExtension = true,
@@ -817,17 +1099,7 @@ public sealed class MainForm : Form
 
         try
         {
-            if (string.Equals(Path.GetExtension(dlg.FileName), ".txt", StringComparison.OrdinalIgnoreCase))
-            {
-                File.WriteAllLines(dlg.FileName, _shownGeos.Select(g => g.Name), new UTF8Encoding(true));
-            }
-            else
-            {
-                var lines = new List<string> { "Гео;Офферов;Уникальных товаров;Файл" };
-                lines.AddRange(_shownGeos.Select(g => $"{Csv(g.Name)};{g.Offers};{g.UniqueProducts};{Csv(g.Files)}"));
-                File.WriteAllLines(dlg.FileName, lines, new UTF8Encoding(true)); // BOM — чтобы Excel правильно показал кириллицу
-            }
-
+            ReportExporter.WriteGeo(dlg.FileName, _shownGeos);
             Settings.LastExportDir = Path.GetDirectoryName(dlg.FileName);
             SaveStorage();
             _status.Text = $"Гео выгружено ({_shownGeos.Count:N0} строк): {dlg.FileName}";
@@ -836,6 +1108,35 @@ public sealed class MainForm : Form
         {
             MessageBox.Show(this, "Не удалось записать файл: " + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private static string BuildReportText(NetworkConfig net, NetworkCheckResult r)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(BuildSummary(net, r));
+
+        if (r.Comparison is { } c)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Сравнение:");
+            foreach (var m in c.Metrics)
+            {
+                sb.AppendLine($"  {m.Name}: сейчас {RunComparer.Fmt(m.Current, m.Decimal)}; " +
+                              $"прошлая {(m.Previous is null ? "—" : RunComparer.Fmt(m.Previous.Value, m.Decimal))}; " +
+                              $"изменение {(m.DeltaPercent is null ? "—" : RunComparer.PctText(m.DeltaPercent.Value))}; " +
+                              $"среднее {(m.Average is null ? "—" : RunComparer.Fmt(m.Average.Value, m.Decimal))}; " +
+                              $"эталон {(m.Expected is null ? "—" : RunComparer.Fmt(m.Expected.Value, m.Decimal))}; {m.Status}");
+            }
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("Проблемы (не более 5000 строк):");
+        foreach (var i in AllIssues(r).Take(5000))
+        {
+            string sev = i.Severity == IssueSeverity.Error ? "ОШИБКА" : "предупр.";
+            sb.AppendLine($"  [{sev}] {IssueInfo.Title(i.Code)} | {i.File} | {i.Where} | {i.Details}");
+        }
+        return sb.ToString();
     }
 
     private void OnSaveReport()
@@ -851,7 +1152,7 @@ public sealed class MainForm : Form
         using var dlg = new SaveFileDialog
         {
             Title = "Сохранить отчёт",
-            Filter = "Текстовый файл (*.txt)|*.txt",
+            Filter = "Excel, книга с листами (*.xlsx)|*.xlsx|CSV для Excel (*.csv)|*.csv|Текстовый отчёт (*.txt)|*.txt|JSON (*.json)|*.json",
             FileName = $"{SafeName(net.Name)}_отчёт_{DateTime.Now:yyyyMMdd_HHmm}",
             InitialDirectory = ExportDir(),
             AddExtension = true,
@@ -861,35 +1162,93 @@ public sealed class MainForm : Form
 
         try
         {
-            var sb = new StringBuilder();
-            sb.AppendLine(BuildSummary(net, r));
-
-            if (r.Comparison is { } c)
-            {
-                sb.AppendLine();
-                sb.AppendLine("Сравнение:");
-                foreach (var m in c.Metrics)
-                {
-                    sb.AppendLine($"  {m.Name}: сейчас {RunComparer.Fmt(m.Current, m.Decimal)}; " +
-                                  $"прошлая {(m.Previous is null ? "—" : RunComparer.Fmt(m.Previous.Value, m.Decimal))}; " +
-                                  $"изменение {(m.DeltaPercent is null ? "—" : RunComparer.PctText(m.DeltaPercent.Value))}; " +
-                                  $"среднее {(m.Average is null ? "—" : RunComparer.Fmt(m.Average.Value, m.Decimal))}; " +
-                                  $"эталон {(m.Expected is null ? "—" : RunComparer.Fmt(m.Expected.Value, m.Decimal))}; {m.Status}");
-                }
-            }
-
-            sb.AppendLine();
-            sb.AppendLine("Проблемы (не более 5000 строк):");
-            foreach (var i in AllIssues(r).Take(5000))
-            {
-                string sev = i.Severity == IssueSeverity.Error ? "ОШИБКА" : "предупр.";
-                sb.AppendLine($"  [{sev}] {IssueInfo.Title(i.Code)} | {i.File} | {i.Where} | {i.Details}");
-            }
-
-            File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true));
+            ReportExporter.WriteReport(dlg.FileName, net.Name, r, () => BuildReportText(net, r));
             Settings.LastExportDir = Path.GetDirectoryName(dlg.FileName);
             SaveStorage();
             _status.Text = "Отчёт сохранён: " + dlg.FileName;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Не удалось записать файл: " + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static long TotalIssueCount(NetworkCheckResult r)
+    {
+        long total = 0;
+        if (r.Run is not null)
+        {
+            total += r.Run.Files.Sum(f => f.Issues.Totals.Values.Sum());
+            total += r.Run.Summary.NetworkIssues.Count;
+        }
+        if (r.Comparison is not null) total += r.Comparison.Problems;
+        return total;
+    }
+
+    private void OnSaveErrors()
+    {
+        var withResults = _storage.Networks.Where(n => _results.TryGetValue(n.Id, out var res) && res.Run is not null).ToList();
+        if (withResults.Count == 0)
+        {
+            MessageBox.Show(this, "Пока нет результатов проверки. Сначала запустите проверку.",
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        List<NetworkConfig> nets;
+        var selected = Selected();
+        bool selectedHasResult = selected is not null && withResults.Any(n => n.Id == selected.Id);
+        if (withResults.Count > 1)
+        {
+            var answer = MessageBox.Show(this,
+                "Сохранить ошибки по всем сетям, проверенным в этой сессии?\n\nДа — по всем сетям\nНет — только по выбранной сети\nОтмена — ничего не делать",
+                "Сохранить ошибки", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) return;
+            if (answer == DialogResult.Yes) nets = withResults;
+            else if (selectedHasResult) nets = new List<NetworkConfig> { selected! };
+            else
+            {
+                MessageBox.Show(this, "Выберите в списке сеть, для которой есть результат.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+        }
+        else nets = withResults;
+
+        var rows = new List<IssueRow>();
+        long total = 0;
+        foreach (var n in nets)
+        {
+            var r = _results[n.Id];
+            total += TotalIssueCount(r);
+            foreach (var i in AllIssues(r)) rows.Add(IssueExporter.ToRow(n.Name, i));
+        }
+
+        if (rows.Count == 0)
+        {
+            MessageBox.Show(this, "Ошибок и предупреждений нет — сохранять нечего.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string label = nets.Count == 1 ? SafeName(nets[0].Name) : "все_сети";
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Сохранить ошибки",
+            Filter = "Excel (*.xlsx)|*.xlsx|CSV для Excel (*.csv)|*.csv|Текстовый файл (*.txt)|*.txt|JSON (*.json)|*.json",
+            FileName = $"ошибки_{label}_{DateTime.Now:yyyyMMdd_HHmm}",
+            InitialDirectory = ExportDir(),
+            AddExtension = true,
+            OverwritePrompt = true,
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        try
+        {
+            IssueExporter.Write(dlg.FileName, rows);
+            Settings.LastExportDir = Path.GetDirectoryName(dlg.FileName);
+            SaveStorage();
+            _status.Text = $"Ошибки сохранены ({rows.Count:N0} строк" +
+                           (total > rows.Count ? $", всего найдено {total:N0}: подробно хранится не более 20 000 записей каждого типа" : "") +
+                           $"): {dlg.FileName}";
         }
         catch (Exception ex)
         {
