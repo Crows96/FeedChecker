@@ -297,6 +297,8 @@ public static class ReportExporter
         _ => "—",
     };
 
+    private static string DateText(DateTime? utc) => utc is { } d ? d.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : "";
+
     private static double? Finite(double? v) => v is { } d && !double.IsNaN(d) && !double.IsInfinity(d) ? d : null;
 
     private static List<Sheet> ReportSheets(Sheet summary, Sheet cmp, Sheet? geoCmp, Sheet files, Sheet geo, Sheet problems)
@@ -313,7 +315,7 @@ public static class ReportExporter
     {
         IEnumerable<FeedIssue> all = r.Run is null ? Enumerable.Empty<FeedIssue>()
             : r.Run.Files.SelectMany(f => f.Issues.Items).Concat(r.Run.Summary.NetworkIssues);
-        if (r.Comparison is not null) all = all.Concat(r.Comparison.Issues.Items);
+        if (r.Comparison is not null) all = all.Concat(r.Comparison.VisibleIssues);
         return all.OrderBy(i => i.Severity).ThenBy(i => i.Code);
     }
 
@@ -380,15 +382,15 @@ public static class ReportExporter
         if (r.Comparison is { } gc && gc.GeoRows.Count > 0)
         {
             geoCmp = new Sheet("Сравнение по гео",
-                new[] { "Гео", "Уникальных сейчас", "Прошлая проверка", "Изменение", "Изменение, %", "Среднее за период", "Статус" },
-                new double[] { 60, 18, 18, 12, 14, 18, 14 });
+                new[] { "Гео", "Уникальных сейчас", "Было", "Изменение", "Изменение, %", "Среднее за период", "Статус", "Впервые видели", "Последний раз", "Скрыто" },
+                new double[] { 60, 18, 12, 12, 14, 18, 14, 16, 16, 10 });
             foreach (var g in gc.GeoRows)
                 geoCmp.Rows.Add(new object?[]
                 {
                     g.Name, g.Current, g.Previous, g.Delta,
                     g.DeltaPercent is { } dp2 ? Math.Round(dp2, 1) : null,
                     g.Average is { } av ? Math.Round(av, 1) : null,
-                    g.Status,
+                    g.Status, DateText(g.FirstSeenUtc), DateText(g.LastSeenUtc), g.Hidden ? "да" : "",
                 });
         }
 
@@ -424,6 +426,7 @@ public static class ReportExporter
                     GeoComparison = r.Comparison?.GeoRows.Select(g => new
                     {
                         g.Name, g.Current, g.Previous, g.Delta, DeltaPercent = Finite(g.DeltaPercent), g.Average, g.Status,
+                        FirstSeen = DateText(g.FirstSeenUtc), LastSeen = DateText(g.LastSeenUtc), g.Hidden,
                     }),
                     Files = run.Files.Select(f => new
                     {

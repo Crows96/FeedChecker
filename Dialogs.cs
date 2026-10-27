@@ -222,6 +222,7 @@ internal sealed class SettingsDialog : Form
     private readonly TextBox _history = new();
     private readonly CheckBox _delete = new() { Text = "Удалять скачанные файлы после проверки" };
     private readonly NumericUpDown _days = new() { Minimum = 1, Maximum = 365 };
+    private readonly NumericUpDown _geoDays = new() { Minimum = 1, Maximum = 3650 };
     private readonly NumericUpDown _tol = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _geoDrop = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _tz = new() { Minimum = -12, Maximum = 14 };
@@ -254,9 +255,10 @@ internal sealed class SettingsDialog : Form
         _delete.SetBounds(12, 136, 400, 24);
         general.Controls.Add(_delete);
         AddNumberRow(general, "Хранить историю, дней:", _days, 176, "");
-        AddNumberRow(general, "Допуск изменения по сети, %:", _tol, 208, "к прошлой проверке и к среднему за период");
-        AddNumberRow(general, "Порог падения офферов у гео, %:", _geoDrop, 240, "предупреждать, если у магазина/региона стало меньше на столько");
-        AddNumberRow(general, "Часовой пояс для «сегодня» (UTC+):", _tz, 272, "3 — Москва");
+        AddNumberRow(general, "Помнить гео, дней:", _geoDays, 208, "пропавший магазин/регион остаётся в списке «Пропало» столько дней");
+        AddNumberRow(general, "Допуск изменения по сети, %:", _tol, 240, "к прошлой проверке и к среднему за период");
+        AddNumberRow(general, "Порог падения офферов у гео, %:", _geoDrop, 272, "предупреждать, если у магазина/региона стало меньше на столько");
+        AddNumberRow(general, "Часовой пояс для «сегодня» (UTC+):", _tz, 304, "3 — Москва");
 
         var existing = _s.S3Connections;
         _s3a = new S3Editor(pageA, existing.Count > 0 ? existing[0] : null, null, null,
@@ -275,6 +277,7 @@ internal sealed class SettingsDialog : Form
         _history.Text = _s.HistoryDir;
         _delete.Checked = _s.DeleteDownloaded;
         _days.Value = Math.Clamp(_s.KeepHistoryDays, 1, 365);
+        _geoDays.Value = Math.Clamp(_s.GeoHistoryDays, 1, 3650);
         _tol.Value = (decimal)Math.Clamp(_s.NetworkTolerancePercent, 0, 100);
         _geoDrop.Value = (decimal)Math.Clamp(_s.GeoDropPercent, 0, 100);
         _tz.Value = Math.Clamp(_s.TimezoneHours, -12, 14);
@@ -338,6 +341,7 @@ internal sealed class SettingsDialog : Form
         _s.HistoryDir = hist;
         _s.DeleteDownloaded = _delete.Checked;
         _s.KeepHistoryDays = (int)_days.Value;
+        _s.GeoHistoryDays = (int)_geoDays.Value;
         _s.NetworkTolerancePercent = (double)_tol.Value;
         _s.GeoDropPercent = (double)_geoDrop.Value;
         _s.TimezoneHours = (int)_tz.Value;

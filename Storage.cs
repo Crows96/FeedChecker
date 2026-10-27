@@ -53,6 +53,8 @@ public sealed class AppSettings
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FeedChecker", "history");
     public bool DeleteDownloaded { get; set; } = true;
     public int KeepHistoryDays { get; set; } = 14;
+    /// <summary>Сколько дней помнить гео: пропавшее гео показывается как «Пропало», пока не пройдёт этот срок.</summary>
+    public int GeoHistoryDays { get; set; } = 30;
     /// <summary>Допустимое изменение показателей сети относительно прошлой проверки/среднего, %.</summary>
     public double NetworkTolerancePercent { get; set; } = 10;
     /// <summary>Падение числа офферов у одного гео, начиная с которого предупреждаем, %.</summary>
@@ -113,6 +115,7 @@ public sealed class AppSettings
         }
         RunMode = Math.Clamp(RunMode, 0, 2);
         KeepHistoryDays = Math.Clamp(KeepHistoryDays, 1, 365);
+        GeoHistoryDays = Math.Clamp(GeoHistoryDays, 1, 3650);
         NetworkTolerancePercent = Math.Clamp(NetworkTolerancePercent, 0, 100);
         GeoDropPercent = Math.Clamp(GeoDropPercent, 0, 100);
         TimezoneHours = Math.Clamp(TimezoneHours, -12, 14);
@@ -250,6 +253,73 @@ public sealed class RunRecord
     };
 }
 
+// ===================== Реестр гео сети (помнит гео дольше обычной истории) =====================
+
+public sealed class GeoEntry
+{
+    public DateTime FirstSeenUtc { get; set; }
+    public DateTime LastSeenUtc { get; set; }
+    /// <summary>Когда гео вернулось после пропажи (для пометки «Вернулось» в тот же день).</summary>
+    public DateTime? ReturnedUtc { get; set; }
+    /// <summary>Уникальных офферов в последней проверке, где это гео было.</summary>
+    public long LastUnique { get; set; }
+    public long LastOffers { get; set; }
+    /// <summary>Пользователь скрыл это гео (например, магазин просто сменил адрес): предупреждения по нему не показываются.</summary>
+    public bool Hidden { get; set; }
+}
+
+/// <summary>Все гео, которые сеть когда-либо присылала за последние GeoHistoryDays дней, с датами и пометкой «скрыто».</summary>
+public sealed class GeoRegistry
+{
+    public Dictionary<string, GeoEntry> Entries { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>Начальное заполнение по уже сохранённым проверкам (когда реестра ещё нет), чтобы не считать все гео «новыми».</summary>
+    public static GeoRegistry FromHistory(IEnumerable<RunRecord> records)
+    {
+        var reg = new GeoRegistry();
+        foreach (var rec in records.OrderBy(r => r.TimestampUtc))
+        {
+            foreach (var g in rec.Geos)
+            {
+                if (!reg.Entries.TryGetValue(g.Name, out var e))
+                {
+                    e = new GeoEntry { FirstSeenUtc = rec.TimestampUtc };
+                    reg.Entries[g.Name] = e;
+                }
+                e.LastSeenUtc = rec.TimestampUtc;
+                e.LastUnique = g.UniqueProducts;
+                e.LastOffers = g.Offers;
+            }
+        }
+        return reg;
+    }
+
+    /// <summary>Учитывает новую проверку: новые гео добавляются, виденные получают дату, давно пропавшие забываются.</summary>
+    public void Apply(RunRecord record, DateTime? previousRunUtc, int keepDays)
+    {
+        foreach (var g in record.Geos)
+        {
+            if (!Entries.TryGetValue(g.Name, out var e))
+            {
+                e = new GeoEntry { FirstSeenUtc = record.TimestampUtc };
+                Entries[g.Name] = e;
+            }
+            else if (previousRunUtc is { } prev && e.LastSeenUtc < prev)
+            {
+                e.ReturnedUtc = record.TimestampUtc; // в прошлой проверке его не было, теперь вернулось
+            }
+
+            e.LastSeenUtc = record.TimestampUtc;
+            e.LastUnique = g.UniqueProducts;
+            e.LastOffers = g.Offers;
+        }
+
+        var limit = record.TimestampUtc.AddDays(-keepDays);
+        foreach (var name in Entries.Where(kv => kv.Value.LastSeenUtc < limit).Select(kv => kv.Key).ToList())
+            Entries.Remove(name);
+    }
+}
+
 /// <summary>История лежит в папке сети: &lt;HistoryDir&gt;\&lt;id сети&gt;\ГГГГММДД-ЧЧММСС-ммм.json, по файлу на проверку.</summary>
 public sealed class HistoryStore
 {
@@ -276,6 +346,28 @@ public sealed class HistoryStore
         }
         return list.OrderBy(r => r.TimestampUtc).ToList();
     }
+
+    // реестр гео хранится рядом, но с другим расширением, чтобы его не принимали за запись проверки
+    private string GeoPath(string networkId) => Path.Combine(DirFor(networkId), "geo.registry");
+
+    /// <summary>Реестр гео сети. Если его ещё нет, заполняется по сохранённым проверкам.</summary>
+    public GeoRegistry LoadGeoRegistry(string networkId, IReadOnlyList<RunRecord>? seedFrom = null)
+    {
+        string path = GeoPath(networkId);
+        if (File.Exists(path))
+        {
+            try
+            {
+                var reg = JsonSerializer.Deserialize<GeoRegistry>(File.ReadAllText(path, Encoding.UTF8), Json.Options);
+                if (reg is not null) return reg;
+            }
+            catch { /* повреждённый реестр пересоздаём по истории */ }
+        }
+
+        return seedFrom is { Count: > 0 } ? GeoRegistry.FromHistory(seedFrom) : new GeoRegistry();
+    }
+
+    public void SaveGeoRegistry(string networkId, GeoRegistry registry) => Json.WriteAtomic(GeoPath(networkId), registry);
 
     public void Save(RunRecord record)
     {

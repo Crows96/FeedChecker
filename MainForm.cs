@@ -44,6 +44,9 @@ public sealed class MainForm : Form
     private readonly TabPage _tabGeoCmp = new("Сравнение по гео");
     private readonly DataGridView _gridGeoCmp = MakeGrid();
     private readonly CheckBox _chkOnlyDiffs = new() { Text = "Только расхождения", AutoSize = true };
+    private readonly CheckBox _chkShowHidden = new() { Text = "Показывать скрытые", AutoSize = true };
+    private readonly Button _btnHideGeo = new() { Text = "Скрыть выбранные", AutoSize = true };
+    private readonly Button _btnUnhideGeo = new() { Text = "Вернуть выбранные", AutoSize = true };
     private readonly Label _lblGeoCmp = new() { AutoSize = true };
     private readonly DataGridView _gridIssues = MakeGrid();
     private readonly DataGridView _gridGeo = MakeGrid();
@@ -168,10 +171,16 @@ public sealed class MainForm : Form
         var geoCmpLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
         geoCmpLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         geoCmpLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var geoCmpBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Padding = new Padding(4, 4, 4, 0) };
-        _chkOnlyDiffs.Margin = new Padding(3, 3, 18, 3);
-        _lblGeoCmp.Margin = new Padding(3, 5, 3, 3);
+        var geoCmpBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(4, 4, 4, 0) };
+        _chkOnlyDiffs.Margin = new Padding(3, 6, 12, 3);
+        _chkShowHidden.Margin = new Padding(3, 6, 12, 3);
+        _lblGeoCmp.Margin = new Padding(3, 6, 3, 3);
+        _tip.SetToolTip(_btnHideGeo, "Скрыть выделенные гео (например, магазин просто сменил адрес): по ним не будет предупреждений.");
+        _tip.SetToolTip(_btnUnhideGeo, "Вернуть выделенные скрытые гео (включите «Показывать скрытые», чтобы их увидеть).");
         geoCmpBar.Controls.Add(_chkOnlyDiffs);
+        geoCmpBar.Controls.Add(_chkShowHidden);
+        geoCmpBar.Controls.Add(_btnHideGeo);
+        geoCmpBar.Controls.Add(_btnUnhideGeo);
         geoCmpBar.Controls.Add(_lblGeoCmp);
         geoCmpLayout.Controls.Add(geoCmpBar, 0, 0);
         geoCmpLayout.Controls.Add(_gridGeoCmp, 0, 1);
@@ -282,12 +291,17 @@ public sealed class MainForm : Form
             if (status is not null && status != "OK" && status != "нет истории") e.CellStyle.BackColor = Caution;
         };
         _chkOnlyDiffs.CheckedChanged += (_, _) => ApplyGeoCmpFilter();
+        _chkShowHidden.CheckedChanged += (_, _) => ApplyGeoCmpFilter();
+        _btnHideGeo.Click += (_, _) => ToggleGeoHidden(true);
+        _btnUnhideGeo.Click += (_, _) => ToggleGeoHidden(false);
         _gridGeoCmp.CellFormatting += (_, e) =>
         {
-            if (e.CellStyle is null || e.RowIndex < 0 || e.RowIndex >= _gridGeoCmp.Rows.Count) return;
-            var status = _gridGeoCmp.Rows[e.RowIndex].Cells[6].Value as string;
+            if (e.CellStyle is null || e.RowIndex < 0 || e.RowIndex >= _gridGeoCmp.Rows.Count || _gridGeoCmp.Columns.Count < 10) return;
+            var row = _gridGeoCmp.Rows[e.RowIndex];
+            if (row.Cells[9].Value as string == "да") { e.CellStyle.ForeColor = SystemColors.GrayText; return; }
+            var status = row.Cells[6].Value as string;
             if (status is "Пропало" or "Падение") e.CellStyle.BackColor = Bad;
-            else if (status is "Новое" or "Рост") e.CellStyle.BackColor = Caution;
+            else if (status is "Новое" or "Рост" or "Вернулось") e.CellStyle.BackColor = Caution;
         };
         _gridIssues.CellFormatting += (_, e) =>
         {
@@ -773,15 +787,17 @@ public sealed class MainForm : Form
         _results[net.Id] = r;
         if (r.Record is not null) _lastRecords[net.Id] = r.Record;
 
-        var item = ItemFor(net.Id);
-        if (item is not null)
-        {
-            var (text, color) = StatusOf(r);
-            SetRow(item, text, color, r.Run?.Summary.DateStartMax, r.FinishedLocal.ToString("dd.MM HH:mm"));
-        }
-
+        UpdateRowFromResult(r);
         UpdateFreshLabel();
         if (Selected()?.Id == net.Id) ShowSelected();
+    }
+
+    private void UpdateRowFromResult(NetworkCheckResult r)
+    {
+        var item = ItemFor(r.Network.Id);
+        if (item is null) return;
+        var (text, color) = StatusOf(r);
+        SetRow(item, text, color, r.Run?.Summary.DateStartMax, r.FinishedLocal.ToString("dd.MM HH:mm"));
     }
 
     // ------------------------------------------------------------------ показ результата
@@ -930,7 +946,7 @@ public sealed class MainForm : Form
     {
         IEnumerable<FeedIssue> all = r.Run is null ? Enumerable.Empty<FeedIssue>()
             : r.Run.Files.SelectMany(f => f.Issues.Items).Concat(r.Run.Summary.NetworkIssues);
-        if (r.Comparison is not null) all = all.Concat(r.Comparison.Issues.Items);
+        if (r.Comparison is not null) all = all.Concat(r.Comparison.VisibleIssues);
         return all.OrderBy(i => i.Severity).ThenBy(i => i.Code);
     }
 
@@ -967,11 +983,16 @@ public sealed class MainForm : Form
 
     private void ApplyGeoCmpFilter()
     {
-        if (_gridGeoCmp.DataSource is DataTable table)
-            table.DefaultView.RowFilter = _chkOnlyDiffs.Checked ? "[Статус] <> 'OK'" : "";
+        if (_gridGeoCmp.DataSource is not DataTable table) return;
+        var parts = new List<string>();
+        if (!_chkShowHidden.Checked) parts.Add("[Скрыто] = ''");
+        if (_chkOnlyDiffs.Checked) parts.Add("[Статус] <> 'OK'");
+        table.DefaultView.RowFilter = string.Join(" AND ", parts);
     }
 
-    /// <summary>Вкладка «Сравнение по гео»: уникальные офферы каждого магазина/региона сейчас и в прошлой проверке.</summary>
+    private static string DateText(DateTime? utc) => utc is { } d ? d.ToLocalTime().ToString("yyyy-MM-dd") : "";
+
+    /// <summary>Вкладка «Сравнение по гео»: уникальные офферы каждого магазина/региона сейчас и раньше, с историей появления и пропаж.</summary>
     private void FillGeoComparison(ComparisonResult? c)
     {
         if (c is null || c.GeoRows.Count == 0)
@@ -983,11 +1004,14 @@ public sealed class MainForm : Form
         var table = new DataTable();
         table.Columns.Add("Гео", typeof(string));
         table.Columns.Add("Уникальных сейчас", typeof(long));
-        table.Columns.Add("Прошлая проверка", typeof(long));
+        table.Columns.Add("Было", typeof(long));
         table.Columns.Add("Изменение", typeof(long));
         table.Columns.Add("Изменение, %", typeof(double));
         table.Columns.Add(c.AverageCount >= 2 ? $"Среднее за {c.KeepDays} дн." : "Среднее за период", typeof(double));
         table.Columns.Add("Статус", typeof(string));
+        table.Columns.Add("Впервые видели", typeof(string));
+        table.Columns.Add("Последний раз", typeof(string));
+        table.Columns.Add("Скрыто", typeof(string));
         table.BeginLoadData();
         foreach (var g in c.GeoRows)
         {
@@ -997,12 +1021,15 @@ public sealed class MainForm : Form
                 (object?)g.Delta ?? DBNull.Value,
                 (object?)g.DeltaPercent ?? DBNull.Value,
                 (object?)g.Average ?? DBNull.Value,
-                g.Status);
+                g.Status,
+                DateText(g.FirstSeenUtc),
+                DateText(g.LastSeenUtc),
+                g.Hidden ? "да" : "");
         }
         table.EndLoadData();
 
         _gridGeoCmp.DataSource = table;
-        if (_gridGeoCmp.Columns.Count >= 7)
+        if (_gridGeoCmp.Columns.Count >= 10)
         {
             _gridGeoCmp.Columns[1].DefaultCellStyle.Format = "N0";
             _gridGeoCmp.Columns[2].DefaultCellStyle.Format = "N0";
@@ -1011,17 +1038,65 @@ public sealed class MainForm : Form
             _gridGeoCmp.Columns[5].DefaultCellStyle.Format = "N1";
         }
 
-        int removed = c.GeoRows.Count(x => x.Status == "Пропало");
-        int dropped = c.GeoRows.Count(x => x.Status == "Падение");
-        int added = c.GeoRows.Count(x => x.Status == "Новое");
-        int grown = c.GeoRows.Count(x => x.Status == "Рост");
-        int diffs = removed + dropped + added + grown;
+        var visible = c.GeoRows.Where(x => !x.Hidden).ToList();
+        int removed = visible.Count(x => x.Status == "Пропало");
+        int dropped = visible.Count(x => x.Status == "Падение");
+        int added = visible.Count(x => x.Status == "Новое");
+        int back = visible.Count(x => x.Status == "Вернулось");
+        int grown = visible.Count(x => x.Status == "Рост");
+        int hidden = c.GeoRows.Count - visible.Count;
 
         _lblGeoCmp.Text = c.Previous is null
             ? "Это первая проверка сети: сравнивать пока не с чем."
-            : $"Гео: {c.GeoRows.Count:N0}. Расхождений: {diffs:N0} (пропало {removed}, упало {dropped}, новых {added}, выросло {grown}). Порог: {Settings.GeoDropPercent:0.#}%";
-        _tabGeoCmp.Text = diffs > 0 ? $"Сравнение по гео ({diffs})" : "Сравнение по гео";
+            : $"Гео: {visible.Count:N0}. Пропало {removed}, упало {dropped}, новых {added}, вернулось {back}, выросло {grown}" +
+              (hidden > 0 ? $". Скрыто: {hidden}" : "") + $". Порог: {Settings.GeoDropPercent:0.#}%";
+        int warnings = removed + dropped + added;
+        _tabGeoCmp.Text = warnings > 0 ? $"Сравнение по гео ({warnings})" : "Сравнение по гео";
         ApplyGeoCmpFilter();
+    }
+
+    /// <summary>Скрыть или вернуть выделенные гео. Пометка хранится в реестре гео сети и сохраняется между проверками.</summary>
+    private void ToggleGeoHidden(bool hidden)
+    {
+        var net = Selected();
+        if (net is null || !_results.TryGetValue(net.Id, out var r) || r.Comparison is null)
+        {
+            MessageBox.Show(this, "Сначала запустите проверку сети: скрывать можно гео из её результата.",
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var names = _gridGeoCmp.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Cells[0].Value as string)
+            .Where(n => !string.IsNullOrEmpty(n))
+            .Select(n => n!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (names.Count == 0)
+        {
+            MessageBox.Show(this, "Выделите в таблице одну или несколько строк.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            var registry = _history.LoadGeoRegistry(net.Id);
+            foreach (var n in names)
+                if (registry.Entries.TryGetValue(n, out var entry)) entry.Hidden = hidden;
+            _history.SaveGeoRegistry(net.Id, registry);
+        }
+        catch (Exception ex)
+        {
+            _status.Text = "Не удалось сохранить пометку: " + ex.Message;
+            return;
+        }
+
+        r.Comparison.SetHidden(names, hidden);
+        UpdateRowFromResult(r);
+        ShowSelected();
+        _status.Text = hidden
+            ? $"Скрыто гео: {names.Count}. Увидеть их можно галочкой «Показывать скрытые», вернуть — кнопкой «Вернуть выбранные»."
+            : $"Возвращено гео: {names.Count}.";
     }
 
     private void FillIssues(NetworkCheckResult r)

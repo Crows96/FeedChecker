@@ -8,6 +8,9 @@ public sealed class CompareSettings
     public double GeoDropPercent { get; init; } = 30;
     public int KeepDays { get; init; } = 14;
     public DateOnly Today { get; init; }
+    public int TimezoneHours { get; init; } = 3;
+    /// <summary>Сколько дней пропавшее гео остаётся в списке «Пропало».</summary>
+    public int GeoHistoryDays { get; init; } = 30;
 }
 
 public sealed class MetricRow
@@ -28,22 +31,28 @@ public sealed class GeoCompareRow
 {
     public string Name { get; init; } = "";
     public long? Current { get; init; }
+    /// <summary>Сколько было раньше: в прошлой проверке или (для пропавших/вернувшихся) в последней, где гео видели.</summary>
     public long? Previous { get; init; }
     public long? Delta { get; init; }
     public double? DeltaPercent { get; init; }
     /// <summary>Среднее за период (считается, если в истории не меньше двух проверок с этим гео).</summary>
     public double? Average { get; init; }
-    /// <summary>OK, Падение, Рост, Новое, Пропало или «нет истории».</summary>
+    /// <summary>OK, Падение, Рост, Новое, Вернулось, Пропало или «нет истории».</summary>
     public string Status { get; init; } = "";
+    public DateTime? FirstSeenUtc { get; init; }
+    public DateTime? LastSeenUtc { get; init; }
+    /// <summary>Гео скрыто пользователем: не попадает в предупреждения и счётчики.</summary>
+    public bool Hidden { get; set; }
 
     public static int StatusOrder(string status) => status switch
     {
         "Пропало" => 0,
         "Падение" => 1,
         "Новое" => 2,
-        "Рост" => 3,
-        "OK" => 4,
-        _ => 5,
+        "Вернулось" => 3,
+        "Рост" => 4,
+        "OK" => 5,
+        _ => 6,
     };
 }
 
@@ -56,12 +65,35 @@ public sealed class ComparisonResult
     public int KeepDays { get; set; }
     public List<MetricRow> Metrics { get; } = new();
     public IssueCollector Issues { get; } = new(2000);
-    public long Problems => Issues.Totals.Values.Sum();
+    /// <summary>Названия гео, скрытых пользователем.</summary>
+    public HashSet<string> HiddenGeos { get; } = new(StringComparer.Ordinal);
+
+    private static bool IsGeoCode(IssueCode code) =>
+        code is IssueCode.CompareGeoRemoved or IssueCode.CompareGeoAdded or IssueCode.CompareGeoDrop;
+
+    private bool IsHiddenIssue(FeedIssue i) => IsGeoCode(i.Code) && HiddenGeos.Contains(i.Where);
+
+    /// <summary>Проблемы без тех, что относятся к скрытым гео.</summary>
+    public IEnumerable<FeedIssue> VisibleIssues => Issues.Items.Where(i => !IsHiddenIssue(i));
+
+    public long Problems => Issues.Totals.Values.Sum() - Issues.Items.Count(IsHiddenIssue);
+
+    /// <summary>Скрыть или вернуть гео: обновляет и строки сравнения, и список скрытых.</summary>
+    public void SetHidden(IReadOnlyCollection<string> names, bool hidden)
+    {
+        foreach (var n in names)
+        {
+            if (hidden) HiddenGeos.Add(n); else HiddenGeos.Remove(n);
+        }
+        foreach (var row in GeoRows)
+            if (names.Contains(row.Name)) row.Hidden = hidden;
+    }
 }
 
 public static class RunComparer
 {
-    public static ComparisonResult Compare(RunRecord cur, IReadOnlyList<RunRecord> history, Baseline? baseline, CompareSettings s)
+    public static ComparisonResult Compare(RunRecord cur, IReadOnlyList<RunRecord> history, Baseline? baseline, CompareSettings s,
+        GeoRegistry? registry = null)
     {
         var res = new ComparisonResult { KeepDays = s.KeepDays };
         var issues = res.Issues;
@@ -146,30 +178,10 @@ public static class RunComparer
         Metric("Среднее на гео (с дублями)", true, cur.AvgWithDuplicates, r => r.AvgWithDuplicates, null);
         Metric("Среднее на гео (без дублей)", true, cur.AvgWithoutDuplicates, r => r.AvgWithoutDuplicates, bl?.AvgUniquePerGeo);
 
-        // гео: пропало, появилось, резкое падение
-        if (prev is not null)
-        {
-            var pg = prev.Geos.GroupBy(g => g.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
-            var cg = cur.Geos.GroupBy(g => g.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        // ---- гео: сравнение с реестром (помнит не только прошлую проверку, а весь срок GeoHistoryDays)
+        var reg = registry ?? GeoRegistry.FromHistory(past);
+        DateOnly Local(DateTime utc) => DateOnly.FromDateTime(utc.AddHours(s.TimezoneHours));
 
-            foreach (var g in prev.Geos)
-                if (!cg.ContainsKey(g.Name))
-                    issues.Add(IssueCode.CompareGeoRemoved, net, g.Name, $"Было в прошлой проверке (офферов: {g.Offers:N0}), сейчас нет");
-
-            foreach (var g in cur.Geos)
-                if (!pg.ContainsKey(g.Name))
-                    issues.Add(IssueCode.CompareGeoAdded, net, g.Name, $"Нет в прошлой проверке, сейчас офферов: {g.Offers:N0}");
-
-            foreach (var g in cur.Geos)
-            {
-                if (!pg.TryGetValue(g.Name, out var old) || old.Offers <= 0) continue;
-                double drop = (old.Offers - g.Offers) * 100.0 / old.Offers;
-                if (drop >= s.GeoDropPercent && drop > 0)
-                    issues.Add(IssueCode.CompareGeoDrop, net, g.Name, $"было {old.Offers:N0}, стало {g.Offers:N0} (−{drop:0}%)");
-            }
-        }
-
-        // уникальные офферы по каждому гео: сейчас / прошлая проверка / среднее за период
         var prevByName = prev is null
             ? new Dictionary<string, GeoRecord>(StringComparer.Ordinal)
             : prev.Geos.GroupBy(g => g.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
@@ -181,24 +193,16 @@ public static class RunComparer
             foreach (var rec in avgSet)
                 foreach (var g in rec.Geos)
                 {
-                    acc.TryGetValue(g.Name, out var a);
-                    acc[g.Name] = (a.Sum + g.UniqueProducts, a.Count + 1);
+                    acc.TryGetValue(g.Name, out var a0);
+                    acc[g.Name] = (a0.Sum + g.UniqueProducts, a0.Count + 1);
                 }
-            foreach (var (name, a) in acc)
-                if (a.Count >= 2) avgByName[name] = a.Sum / a.Count;
+            foreach (var (name, a1) in acc)
+                if (a1.Count >= 2) avgByName[name] = a1.Sum / a1.Count;
         }
 
-        GeoCompareRow MakeRow(string name, long? now, long? before)
+        GeoCompareRow MakeRow(string name, long? now, long? before, string status, GeoEntry? e, DateTime? firstSeen, DateTime? lastSeen)
         {
             double? pct = Pct(now ?? 0, before);
-            string status;
-            if (prev is null) status = "нет истории";
-            else if (now is null) status = "Пропало";
-            else if (before is null) status = "Новое";
-            else if (pct is { } down && down < 0 && down <= -s.GeoDropPercent) status = "Падение";
-            else if (pct is { } up && up > 0 && up >= s.GeoDropPercent) status = "Рост";
-            else status = "OK";
-
             return new GeoCompareRow
             {
                 Name = name,
@@ -208,23 +212,56 @@ public static class RunComparer
                 DeltaPercent = pct is { } p && !double.IsInfinity(p) ? p : null,
                 Average = avgByName.TryGetValue(name, out var av) ? av : null,
                 Status = status,
+                FirstSeenUtc = firstSeen,
+                LastSeenUtc = lastSeen,
+                Hidden = e?.Hidden == true,
             };
         }
 
+        var firstRunUtc = past.FirstOrDefault()?.TimestampUtc; // гео из самой первой проверки сети «новыми» не считаются
         var rows = new List<GeoCompareRow>();
         var curNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var g in cur.Geos)
         {
             curNames.Add(g.Name);
-            rows.Add(MakeRow(g.Name, g.UniqueProducts, prevByName.TryGetValue(g.Name, out var old) ? old.UniqueProducts : null));
+            reg.Entries.TryGetValue(g.Name, out var e);
+            long? before = prevByName.TryGetValue(g.Name, out var pg) ? pg.UniqueProducts : e?.LastUnique;
+            double? pct = Pct(g.UniqueProducts, before);
+
+            string status;
+            if (prev is null && e is null) status = "нет истории";
+            // новое: раньше не встречалось, либо появилось сегодня уже после самой первой проверки сети (держится при повторных запусках в тот же день)
+            else if (e is null || (Local(e.FirstSeenUtc) == s.Today && firstRunUtc is { } fr && e.FirstSeenUtc > fr)) status = "Новое";
+            else if ((prev is not null && e.LastSeenUtc < prev.TimestampUtc) || (e.ReturnedUtc is { } ret && Local(ret) == s.Today)) status = "Вернулось";
+            else if (pct is { } down && down < 0 && down <= -s.GeoDropPercent) status = "Падение";
+            else if (pct is { } up && up > 0 && up >= s.GeoDropPercent) status = "Рост";
+            else status = "OK";
+
+            rows.Add(MakeRow(g.Name, g.UniqueProducts, before, status, e, e?.FirstSeenUtc ?? cur.TimestampUtc, cur.TimestampUtc));
+
+            if (status == "Новое")
+                issues.Add(IssueCode.CompareGeoAdded, net, g.Name, $"Новое гео: раньше не встречалось, уникальных офферов: {g.UniqueProducts:N0}");
+            else if (status == "Падение" && pct is { } dropPct)
+                issues.Add(IssueCode.CompareGeoDrop, net, g.Name, $"было {before:N0}, стало {g.UniqueProducts:N0} (−{Math.Abs(dropPct):0}%)");
         }
-        foreach (var g in prevByName.Values)
-            if (!curNames.Contains(g.Name)) rows.Add(MakeRow(g.Name, null, g.UniqueProducts));
+
+        foreach (var (name, e) in reg.Entries)
+        {
+            if (curNames.Contains(name) || e.LastSeenUtc >= cur.TimestampUtc) continue;
+            double daysAgo = (cur.TimestampUtc - e.LastSeenUtc).TotalDays;
+            if (daysAgo > s.GeoHistoryDays) continue; // слишком давно — уже не показываем (реестр сам его забудет)
+
+            rows.Add(MakeRow(name, null, e.LastUnique, "Пропало", e, e.FirstSeenUtc, e.LastSeenUtc));
+            issues.Add(IssueCode.CompareGeoRemoved, net, name,
+                $"Нет в этой проверке. Последний раз было {Local(e.LastSeenUtc):dd.MM.yyyy} ({Math.Floor(daysAgo):0} дн. назад), уникальных офферов: {e.LastUnique:N0}");
+        }
 
         res.GeoRows.AddRange(rows
             .OrderBy(x => GeoCompareRow.StatusOrder(x.Status))
             .ThenBy(x => x.DeltaPercent ?? 0)
             .ThenBy(x => x.Name, StringComparer.CurrentCulture));
+        foreach (var row in res.GeoRows)
+            if (row.Hidden) res.HiddenGeos.Add(row.Name);
 
         return res;
     }
@@ -299,13 +336,18 @@ public static class NetworkChecker
         {
             var record = RunRecord.From(net, run.Summary, run.Files, DateTime.UtcNow);
             var past = history.Load(net.Id);
+            var registry = history.LoadGeoRegistry(net.Id, past);
             var cmp = RunComparer.Compare(record, past, net.Baseline, new CompareSettings
             {
                 NetworkTolerancePercent = settings.NetworkTolerancePercent,
                 GeoDropPercent = settings.GeoDropPercent,
                 KeepDays = settings.KeepHistoryDays,
                 Today = settings.Today(),
-            });
+                TimezoneHours = settings.TimezoneHours,
+                GeoHistoryDays = settings.GeoHistoryDays,
+            }, registry);
+            registry.Apply(record, past.LastOrDefault()?.TimestampUtc, settings.GeoHistoryDays);
+            history.SaveGeoRegistry(net.Id, registry);
             history.Save(record);
             history.Purge(net.Id, settings.KeepHistoryDays);
             result.Record = record;
