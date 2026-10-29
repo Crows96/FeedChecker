@@ -31,6 +31,13 @@ public enum IssueCode
     CompareGeoRemoved,
     CompareGeoAdded,
     CompareGeoDrop,
+    // сверка с Фронтиром
+    FrontierLoadFailed,
+    FrontierNotUpdated,
+    FrontierPeriodMismatch,
+    FrontierOffersMismatch,
+    FrontierGeoMissing,
+    FrontierGeoExtra,
 }
 
 public sealed record FeedIssue(IssueSeverity Severity, IssueCode Code, string File, string Where, string Details);
@@ -68,6 +75,12 @@ public static class IssueInfo
         IssueCode.CompareGeoRemoved => "Гео пропало с прошлой проверки",
         IssueCode.CompareGeoAdded => "Гео появилось с прошлой проверки",
         IssueCode.CompareGeoDrop => "Резкое падение офферов у гео",
+        IssueCode.FrontierLoadFailed => "Фронтир: не удалось получить данные",
+        IssueCode.FrontierNotUpdated => "Фронтир: данные не обновлены или обновлены не полностью",
+        IssueCode.FrontierPeriodMismatch => "Фронтир: период каталога не совпадает с JSON",
+        IssueCode.FrontierOffersMismatch => "Фронтир: число офферов не совпадает с JSON",
+        IssueCode.FrontierGeoMissing => "Фронтир: гео из JSON нет во Фронтире",
+        IssueCode.FrontierGeoExtra => "Фронтир: каталога нет в JSON",
         _ => code.ToString(),
     };
 }
@@ -110,6 +123,8 @@ public sealed class GeoStat
     public long Offers;
     /// <summary>Хэши уникальных товаров гео.</summary>
     public HashSet<ulong> Products = new();
+    /// <summary>Самый поздний date_start среди каталогов гео.</summary>
+    public DateOnly? DateStart;
 }
 
 public sealed class FeedFileResult
@@ -145,9 +160,16 @@ public sealed class FeedFileResult
 
     public IssueCollector Issues { get; }
 
+    /// <summary>Заполняется при загрузке сохранённого результата: тогда Geos пуст, а числа берутся отсюда.</summary>
+    public long? UniqueProductsOverride { get; set; }
+    public int? GeoCountOverride { get; set; }
+
+    public int GeoCount => GeoCountOverride ?? Geos.Count;
+
     /// <summary>Уникальные товары файла (без дублей), объединение по всем гео.</summary>
     public long UniqueProducts()
     {
+        if (UniqueProductsOverride is { } saved) return saved;
         var all = new HashSet<ulong>(NoGeoProducts);
         foreach (var g in Geos.Values) all.UnionWith(g.Products);
         return all.Count;
@@ -182,6 +204,7 @@ public sealed class GeoRow
     public long Offers { get; init; }
     public long UniqueProducts { get; init; }
     public string Files { get; init; } = "";
+    public DateOnly? DateStart { get; init; }
 }
 
 public sealed class NetworkSummary
@@ -208,7 +231,7 @@ public sealed class NetworkSummary
     public static NetworkSummary Build(string name, IReadOnlyList<FeedFileResult> files)
     {
         var valid = files.Where(f => f.IsValid).ToList();
-        var geos = new Dictionary<string, (long Offers, HashSet<ulong> Products, List<string> Files)>(StringComparer.Ordinal);
+        var geos = new Dictionary<string, (long Offers, HashSet<ulong> Products, List<string> Files, DateOnly? Date)>(StringComparer.Ordinal);
         var allProducts = new HashSet<ulong>();
         var issues = new List<FeedIssue>();
         long offers = 0;
@@ -228,7 +251,7 @@ public sealed class NetworkSummary
             {
                 if (!geos.TryGetValue(geo, out var cur))
                 {
-                    cur = (0, new HashSet<ulong>(), new List<string>());
+                    cur = (0, new HashSet<ulong>(), new List<string>(), null);
                     geos[geo] = cur;
                 }
                 else if (!cur.Files.Contains(f.DisplayName))
@@ -238,6 +261,7 @@ public sealed class NetworkSummary
                 }
 
                 cur.Offers += st.Offers;
+                if (st.DateStart is { } sd && (cur.Date is null || sd > cur.Date)) cur.Date = sd;
                 cur.Products.UnionWith(st.Products);
                 if (!cur.Files.Contains(f.DisplayName)) cur.Files.Add(f.DisplayName);
                 geos[geo] = cur;
@@ -255,6 +279,7 @@ public sealed class NetworkSummary
             Offers = kv.Value.Offers,
             UniqueProducts = kv.Value.Products.Count,
             Files = string.Join(", ", kv.Value.Files),
+            DateStart = kv.Value.Date,
         }).OrderBy(r => r.Name, StringComparer.CurrentCulture).ToList();
 
         return new NetworkSummary

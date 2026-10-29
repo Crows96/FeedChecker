@@ -363,10 +363,12 @@ public sealed class FeedAnalyzer
         if (offersCount == 0)
             res.Issues.Add(IssueCode.EmptyCatalog, res.DisplayName, where, "В каталоге нет офферов");
 
+        DateOnly? catalogDate = null;
         // date_start: сравниваем только дату, как она записана в фиде
         if (dateStart is not null && DateTimeOffset.TryParse(dateStart, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dto))
         {
             var d = DateOnly.FromDateTime(dto.DateTime);
+            catalogDate = d;
             if (res.DateStartMin is null || d < res.DateStartMin) res.DateStartMin = d;
             if (res.DateStartMax is null || d > res.DateStartMax) res.DateStartMax = d;
         }
@@ -406,6 +408,7 @@ public sealed class FeedAnalyzer
             {
                 res.Issues.Add(IssueCode.DuplicateGeoInFile, res.DisplayName, geo, "Гео уже встречалось в другом каталоге этого файла (каталог " + where + ")");
                 gs.Offers += offersCount;
+                if (catalogDate is { } cd && (gs.DateStart is null || cd > gs.DateStart)) gs.DateStart = cd;
                 gs.Products.UnionWith(products);
             }
             else
@@ -413,6 +416,7 @@ public sealed class FeedAnalyzer
                 res.Geos[geo] = new GeoStat
                 {
                     Offers = offersCount,
+                    DateStart = catalogDate,
                     // для единственного гео переиспользуем набор, для нескольких — копируем
                     Products = geos.Count == 1 ? products : new HashSet<ulong>(products),
                 };

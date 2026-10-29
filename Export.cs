@@ -316,6 +316,7 @@ public static class ReportExporter
         IEnumerable<FeedIssue> all = r.Run is null ? Enumerable.Empty<FeedIssue>()
             : r.Run.Files.SelectMany(f => f.Issues.Items).Concat(r.Run.Summary.NetworkIssues);
         if (r.Comparison is not null) all = all.Concat(r.Comparison.VisibleIssues);
+        if (r.Frontier is not null) all = all.Concat(r.Frontier.Issues.Items);
         return all.OrderBy(i => i.Severity).ThenBy(i => i.Code);
     }
 
@@ -333,7 +334,7 @@ public static class ReportExporter
         var run = r.Run ?? throw new InvalidOperationException("Нет результата проверки.");
         var s = run.Summary;
         var issues = AllIssues(r).Take(MaxIssueRows).Select(i => IssueExporter.ToRow(network, i)).ToList();
-        long issuesTotal = run.Files.Sum(f => f.Issues.Totals.Values.Sum()) + s.NetworkIssues.Count + (r.Comparison?.Problems ?? 0);
+        long issuesTotal = run.Files.Sum(f => f.Issues.Totals.Values.Sum()) + s.NetworkIssues.Count + (r.Comparison?.Problems ?? 0) + (r.Frontier?.Problems ?? 0);
 
         // сводка
         var summary = new Sheet("Сводка", new[] { "Показатель", "Значение" }, new double[] { 44, 60 });
@@ -401,7 +402,7 @@ public static class ReportExporter
         foreach (var f in run.Files)
             files.Rows.Add(f.IsValid
                 ? new object?[] { f.DisplayName, Math.Round(f.FileSizeBytes / 1024.0 / 1024.0, 1), Math.Round(f.Elapsed.TotalSeconds, 1),
-                                  f.CatalogCount, f.Geos.Count, f.CatalogOfferRefs, f.UniqueProducts(), "OK" }
+                                  f.CatalogCount, f.GeoCount, f.CatalogOfferRefs, f.UniqueProducts(), "OK" }
                 : new object?[] { f.DisplayName, null, null, null, null, null, null, "Невалиден: " + f.InvalidReason });
 
         var geo = GeoSheet(s.Geos);
@@ -433,13 +434,90 @@ public static class ReportExporter
                         Name = f.DisplayName, Valid = f.IsValid, f.InvalidReason,
                         SizeMb = Math.Round(f.FileSizeBytes / 1024.0 / 1024.0, 1),
                         Seconds = Math.Round(f.Elapsed.TotalSeconds, 1),
-                        f.CatalogCount, Geo = f.Geos.Count, Offers = f.CatalogOfferRefs,
+                        f.CatalogCount, Geo = f.GeoCount, Offers = f.CatalogOfferRefs,
                         UniqueProducts = f.IsValid ? f.UniqueProducts() : 0,
                     }),
                     Geos = s.Geos.Select(g => new { g.Name, g.Offers, g.UniqueProducts, g.Files }),
                     Issues = issues,
                 };
                 File.WriteAllText(path, JsonSerializer.Serialize(doc, Json.Options), new UTF8Encoding(false));
+                break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Фронтир
+
+public sealed record FrontierExportRow(string Network, string Geo, string Files, string Status, long? JsonOffers, long? FrontierOffers,
+    long? Diff, string JsonPeriod, string FrontierPeriod, string Details);
+
+public sealed record FrontierExportSummary(string Network, int RetailerId, string State, int FrontierCatalogs, int JsonGeos,
+    int FreshGeos, long Problems, string Message);
+
+/// <summary>Выгрузка расхождений сверки JSON с Фронтиром: лист «Расхождения» (только строки со статусом не OK) и лист «Итог» по сетям.</summary>
+public static class FrontierExporter
+{
+    private static readonly string[] RowHeaders =
+        { "Сеть", "Гео", "Файл JSON", "Статус", "Офферов в JSON", "Офферов во Фронтире", "Разница", "Период JSON (date_start)", "Период во Фронтире", "Подробности" };
+    private static readonly double[] RowWidths = { 22, 46, 38, 30, 16, 20, 11, 24, 26, 80 };
+    private static readonly string[] SummaryHeaders =
+        { "Сеть", "ID ретейлера", "Итог", "Каталогов во Фронтире", "Гео в JSON", "С актуальным периодом", "Проблем", "Сообщение" };
+    private static readonly double[] SummaryWidths = { 22, 14, 24, 22, 12, 22, 10, 110 };
+
+    private static string D(DateOnly? d) => d is { } x ? x.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : "";
+
+    public static (List<FrontierExportSummary> Summary, List<FrontierExportRow> Rows) Build(
+        IEnumerable<(string Network, FrontierComparison Result)> items)
+    {
+        var summary = new List<FrontierExportSummary>();
+        var rows = new List<FrontierExportRow>();
+        foreach (var (network, f) in items)
+        {
+            summary.Add(new FrontierExportSummary(network, f.RetailerId, FrontierComparison.StateText(f.State),
+                f.FrontierCatalogs, f.JsonGeos, f.Fresh, f.Problems, f.Message));
+
+            foreach (var r in f.Rows.Where(x => x.Status != "OK"))
+            {
+                string frontierPeriod = r.FrontierStart is null ? "" : D(r.FrontierStart) + (r.FrontierEnd is null ? "" : " – " + D(r.FrontierEnd));
+                long? diff = r.JsonOffers is { } j && r.FrontierOffers is { } fo ? fo - j : null;
+                rows.Add(new FrontierExportRow(network, r.Name, r.Files, r.Status, r.JsonOffers, r.FrontierOffers, diff,
+                    D(r.JsonStart), frontierPeriod, r.Details));
+            }
+        }
+        return (summary, rows);
+    }
+
+    public static void Write(string path, IReadOnlyList<(string Network, FrontierComparison Result)> items)
+    {
+        var (summary, rows) = Build(items);
+
+        var rowSheet = new Sheet("Расхождения", RowHeaders, RowWidths);
+        foreach (var r in rows)
+            rowSheet.Rows.Add(new object?[] { r.Network, r.Geo, r.Files, r.Status, r.JsonOffers, r.FrontierOffers, r.Diff, r.JsonPeriod, r.FrontierPeriod, r.Details });
+
+        var sumSheet = new Sheet("Итог", SummaryHeaders, SummaryWidths);
+        foreach (var s in summary)
+            sumSheet.Rows.Add(new object?[] { s.Network, s.RetailerId, s.State, s.FrontierCatalogs, s.JsonGeos, s.FreshGeos, s.Problems, s.Message });
+
+        var sheets = new[] { rowSheet, sumSheet };
+        switch (Path.GetExtension(path).ToLowerInvariant())
+        {
+            case ".xlsx": TableFile.WriteXlsx(path, sheets); break;
+            case ".csv": TableFile.WriteCsv(path, sheets); break;
+            case ".json":
+                File.WriteAllText(path, JsonSerializer.Serialize(new { summary, rows }, Json.Options), new UTF8Encoding(false));
+                break;
+            default:
+                using (var w = new StreamWriter(path, false, new UTF8Encoding(true)))
+                {
+                    w.WriteLine($"Сверка с Фронтиром ({DateTime.Now:dd.MM.yyyy HH:mm})");
+                    foreach (var s in summary)
+                        w.WriteLine($"{s.Network} (ретейлер {s.RetailerId}): {s.State}. {s.Message}");
+                    w.WriteLine();
+                    w.WriteLine($"Расхождений: {rows.Count:N0}");
+                    foreach (var r in rows)
+                        w.WriteLine($"{r.Network} | {r.Geo} | {(r.Files.Length > 0 ? r.Files : "—")} | {r.Status} | JSON {r.JsonOffers?.ToString("N0") ?? "—"} / Фронтир {r.FrontierOffers?.ToString("N0") ?? "—"} | {r.Details}");
+                }
                 break;
         }
     }

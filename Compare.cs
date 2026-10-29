@@ -289,6 +289,8 @@ public sealed class NetworkCheckResult
     public RunRecord? Record { get; set; }
     public ComparisonResult? Comparison { get; set; }
     public bool SavedToHistory { get; set; }
+    /// <summary>Результат сверки с Фронтиром (null — для сети она не включена).</summary>
+    public FrontierComparison? Frontier { get; set; }
     public DateTime FinishedLocal { get; set; } = DateTime.Now;
     /// <summary>Пояснение для пользователя, если сравнение/сохранение пропущено или проверка не удалась.</summary>
     public string? Note { get; set; }
@@ -358,6 +360,9 @@ public static class NetworkChecker
         {
             result.Note = "Проверка выполнена, но историю сохранить не удалось: " + ex.Message;
         }
+
+        if (net.FrontierRetailerId is int frontierId && !ct.IsCancellationRequested)
+            result.Frontier = FrontierChecker.Run(net, frontierId, run.Summary, settings, ct);
 
         return result;
     }

@@ -32,6 +32,8 @@ public sealed class MainForm : Form
     private readonly Button _btnEditNet = new() { Text = "Изменить…", AutoSize = true };
     private readonly Button _btnDelNet = new() { Text = "Удалить", AutoSize = true };
     private readonly Button _btnSettings = new() { Text = "Настройки…", AutoSize = true };
+    private readonly Button _btnSearch = new() { Text = "Поиск товара…", AutoSize = true };
+    private ProductSearchForm? _searchForm;
 
     private readonly ListView _list = new();
     private readonly Label _fresh = new();
@@ -48,6 +50,10 @@ public sealed class MainForm : Form
     private readonly Button _btnHideGeo = new() { Text = "Скрыть выбранные", AutoSize = true };
     private readonly Button _btnUnhideGeo = new() { Text = "Вернуть выбранные", AutoSize = true };
     private readonly Label _lblGeoCmp = new() { AutoSize = true };
+    private readonly TabPage _tabFrontier = new("Фронтир");
+    private readonly DataGridView _gridFrontier = MakeGrid();
+    private readonly CheckBox _chkFrontierDiffs = new() { Text = "Только расхождения", AutoSize = true };
+    private readonly Label _lblFrontier = new() { AutoSize = true, MaximumSize = new Size(760, 0) };
     private readonly DataGridView _gridIssues = MakeGrid();
     private readonly DataGridView _gridGeo = MakeGrid();
     private readonly ProgressBar _progress = new();
@@ -59,6 +65,11 @@ public sealed class MainForm : Form
     {
         _storage = AppStorage.Load();
         _history = new HistoryStore(Settings.HistoryDir);
+        foreach (var (id, saved) in ResultStore.LoadAll(_storage.Networks))
+        {
+            _results[id] = saved;
+            if (saved.Record is not null) _lastRecords[id] = saved.Record;
+        }
 
         Text = "FeedChecker — проверка фидов";
         Font = new Font("Segoe UI", 9F);
@@ -115,6 +126,8 @@ public sealed class MainForm : Form
         bar.Controls.Add(_btnImportS3);
         bar.Controls.Add(_btnEditNet);
         bar.Controls.Add(_btnDelNet);
+        _btnSearch.Margin = new Padding(24, 3, 3, 3);
+        bar.Controls.Add(_btnSearch);
         _btnSettings.Margin = new Padding(24, 3, 3, 3);
         bar.Controls.Add(_btnSettings);
         _btnSave.Margin = new Padding(24, 3, 3, 3);
@@ -187,6 +200,22 @@ public sealed class MainForm : Form
         _tabGeoCmp.Controls.Add(geoCmpLayout);
         _tabs.TabPages.Add(tabCompare);
         _tabs.TabPages.Add(_tabGeoCmp);
+        var frontierLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        frontierLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        frontierLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var frontierBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(4, 4, 4, 0) };
+        _chkFrontierDiffs.Margin = new Padding(3, 6, 12, 3);
+        _lblFrontier.Margin = new Padding(3, 6, 3, 3);
+        _chkFrontierDiffs.CheckedChanged += (_, _) => ApplyFrontierFilter();
+        var btnSaveFrontier = new Button { Text = "Сохранить расхождения…", AutoSize = true, Margin = new Padding(3, 2, 12, 3) };
+        btnSaveFrontier.Click += (_, _) => OnSaveFrontier(selectedOnly: true);
+        frontierBar.Controls.Add(btnSaveFrontier);
+        frontierBar.Controls.Add(_chkFrontierDiffs);
+        frontierBar.Controls.Add(_lblFrontier);
+        frontierLayout.Controls.Add(frontierBar, 0, 0);
+        frontierLayout.Controls.Add(_gridFrontier, 0, 1);
+        _tabFrontier.Controls.Add(frontierLayout);
+        _tabs.TabPages.Add(_tabFrontier);
         _tabs.TabPages.Add(_tabIssues);
         _tabs.TabPages.Add(tabGeo);
 
@@ -249,6 +278,7 @@ public sealed class MainForm : Form
         saveMenu.Items.Add("Выгрузить гео…", null, (_, _) => OnExportGeo());
         saveMenu.Items.Add("Сохранить отчёт…", null, (_, _) => OnSaveReport());
         saveMenu.Items.Add("Сохранить ошибки…", null, (_, _) => OnSaveErrors());
+        saveMenu.Items.Add("Сохранить сверку с Фронтиром…", null, (_, _) => OnSaveFrontier(selectedOnly: false));
         _btnSave.Click += (_, _) => saveMenu.Show(_btnSave, new Point(0, _btnSave.Height));
         _list.ColumnClick += (_, e) =>
         {
@@ -265,6 +295,7 @@ public sealed class MainForm : Form
         _btnEditNet.Click += (_, _) => OnEditNetwork();
         _btnDelNet.Click += (_, _) => OnDeleteNetwork();
         _btnSettings.Click += (_, _) => OnSettings();
+        _btnSearch.Click += (_, _) => OnProductSearch();
 
         _list.SelectedIndexChanged += (_, _) => ShowSelected();
         _list.DoubleClick += (_, _) => { if (_btnEditNet.Enabled) OnEditNetwork(); };
@@ -426,7 +457,7 @@ public sealed class MainForm : Form
         if (r.Run.Files.Count == 0) return ("Нет источников", Color.WhiteSmoke);
         if (r.Run.Files.Any(f => !f.IsValid)) return ("Невалиден", Bad);
         long err = r.Run.Summary.Errors;
-        long warn = r.Run.Summary.Warnings + (r.Comparison?.Problems ?? 0);
+        long warn = r.Run.Summary.Warnings + (r.Comparison?.Problems ?? 0) + (r.Frontier?.Problems ?? 0);
         if (err > 0) return ($"Ошибки: {err}", Bad);
         if (warn > 0) return ($"Предупр.: {warn}", Caution);
         return ("OK", Good);
@@ -537,6 +568,7 @@ public sealed class MainForm : Form
         int index = _storage.Networks.FindIndex(n => n.Id == net.Id);
         if (index >= 0) _storage.Networks[index] = dlg.Result;
         _results.Remove(net.Id); // источники могли измениться — прежний результат неактуален
+        ResultStore.Delete(net.Id);
         SaveStorage();
         RefreshList(net.Id);
     }
@@ -553,6 +585,7 @@ public sealed class MainForm : Form
 
         _storage.Networks.RemoveAll(n => n.Id == net.Id);
         _results.Remove(net.Id);
+        ResultStore.Delete(net.Id);
         _lastRecords.Remove(net.Id);
         SaveStorage();
         RefreshList(null);
@@ -645,6 +678,24 @@ public sealed class MainForm : Form
         _history = new HistoryStore(Settings.HistoryDir);
         _lastRecords.Clear();
         RefreshList(Selected()?.Id);
+    }
+
+    /// <summary>Поиск товара по названию и гео: по файлам сетей или по локальным файлам.</summary>
+    private void OnProductSearch()
+    {
+        if (_searchForm is { IsDisposed: false })
+        {
+            _searchForm.Activate();
+            return;
+        }
+
+        _searchForm = new ProductSearchForm(_storage.Networks, Selected()?.Id, Settings, ExportDir, dir =>
+        {
+            Settings.LastExportDir = dir;
+            SaveStorage();
+        });
+        _searchForm.FormClosed += (_, _) => _searchForm = null;
+        _searchForm.Show(this);
     }
 
     // ------------------------------------------------------------------ запуск
@@ -786,6 +837,7 @@ public sealed class MainForm : Form
         var net = r.Network;
         _results[net.Id] = r;
         if (r.Record is not null) _lastRecords[net.Id] = r.Record;
+        ResultStore.SaveAsync(r);
 
         UpdateRowFromResult(r);
         UpdateFreshLabel();
@@ -807,6 +859,7 @@ public sealed class MainForm : Form
         _summary.Clear();
         _gridCompare.DataSource = null;
         ClearGeoComparison();
+        ClearFrontier();
         _gridIssues.DataSource = null;
         _gridGeo.DataSource = null;
         _shownGeos = new List<GeoRow>();
@@ -825,6 +878,11 @@ public sealed class MainForm : Form
             _summary.Text = BuildSummary(net, r);
             FillComparison(r.Comparison);
             FillGeoComparison(r.Comparison);
+            FillFrontier(r.Frontier);
+            if (r.Frontier is null)
+                _lblFrontier.Text = net.FrontierRetailerId is null
+                    ? "Для этой сети не указан ID ретейлера Фронтира: нажмите «Изменить…» и заполните поле «Фронтир»."
+                    : "Сверка с Фронтиром в этой проверке не выполнялась.";
             FillIssues(r);
             SetGeos(r.Run.Summary.Geos);
             return;
@@ -833,6 +891,7 @@ public sealed class MainForm : Form
         // в этой сессии проверка не запускалась — показываем последнюю сохранённую из истории
         _gridCompare.DataSource = null;
         ClearGeoComparison();
+        ClearFrontier();
         _gridIssues.DataSource = null;
         _tabIssues.Text = "Ошибки и предупреждения";
         _lastRecords.TryGetValue(net.Id, out var rec);
@@ -877,6 +936,14 @@ public sealed class MainForm : Form
             sb.AppendLine($"Расхождений с историей и эталоном: {c.Problems:N0}");
             if (r.Record is { Updated: false })
                 sb.AppendLine("date_start не изменился с прошлой проверки: запись не учитывается в среднем.");
+        }
+
+        if (r.Frontier is { } fr)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Фронтир (ретейлер {fr.RetailerId}): {fr.Message}");
+            if (fr.State != FrontierState.Failed)
+                sb.AppendLine($"  каталогов во Фронтире: {fr.FrontierCatalogs:N0}, гео в JSON: {fr.JsonGeos:N0}, с актуальным периодом: {fr.Fresh:N0}, расхождений: {fr.Problems:N0}");
         }
 
         sb.AppendLine();
@@ -936,7 +1003,7 @@ public sealed class MainForm : Form
             }
 
             sb.AppendLine($"  {f.DisplayName}: {f.FileSizeBytes / 1024.0 / 1024.0:N1} МБ, {f.Elapsed.TotalSeconds:N1} c");
-            sb.AppendLine($"      каталогов {f.CatalogCount:N0}, гео {f.Geos.Count:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
+            sb.AppendLine($"      каталогов {f.CatalogCount:N0}, гео {f.GeoCount:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
         }
 
         return sb.ToString();
@@ -947,6 +1014,7 @@ public sealed class MainForm : Form
         IEnumerable<FeedIssue> all = r.Run is null ? Enumerable.Empty<FeedIssue>()
             : r.Run.Files.SelectMany(f => f.Issues.Items).Concat(r.Run.Summary.NetworkIssues);
         if (r.Comparison is not null) all = all.Concat(r.Comparison.VisibleIssues);
+        if (r.Frontier is not null) all = all.Concat(r.Frontier.Issues.Items);
         return all.OrderBy(i => i.Severity).ThenBy(i => i.Code);
     }
 
@@ -972,6 +1040,48 @@ public sealed class MainForm : Form
         }
 
         _gridCompare.DataSource = table;
+    }
+
+    private void ClearFrontier()
+    {
+        _gridFrontier.DataSource = null;
+        _lblFrontier.Text = "";
+        _tabFrontier.Text = "Фронтир";
+    }
+
+    private void ApplyFrontierFilter()
+    {
+        if (_gridFrontier.DataSource is not DataTable table) return;
+        table.DefaultView.RowFilter = _chkFrontierDiffs.Checked ? "[Статус] <> 'OK'" : "";
+    }
+
+    /// <summary>Вкладка «Фронтир»: по каждому гео — офферы и период в JSON и во Фронтире.</summary>
+    private void FillFrontier(FrontierComparison? f)
+    {
+        if (f is null) { ClearFrontier(); return; }
+        _tabFrontier.Text = $"Фронтир ({FrontierComparison.StateText(f.State)})";
+        _lblFrontier.Text = f.Message;
+        _lblFrontier.ForeColor = f.State == FrontierState.Updated ? Color.DarkGreen : Color.Firebrick;
+
+        var table = new DataTable();
+        foreach (var col in new[] { "Гео", "Файл JSON", "В JSON", "Во Фронтире", "Разница", "Период JSON", "Период Фронтира", "Статус", "Подробности" })
+            table.Columns.Add(col, typeof(string));
+
+        table.BeginLoadData();
+        foreach (var r in f.Rows)
+        {
+            string diff = r.JsonOffers is { } j && r.FrontierOffers is { } fo ? (fo - j).ToString("+#,0;-#,0;0") : "—";
+            string jsonPeriod = r.JsonStart is { } js ? js.ToString("yyyy-MM-dd") : "—";
+            string frontierPeriod = r.FrontierStart is { } fs
+                ? fs.ToString("yyyy-MM-dd") + (r.FrontierEnd is { } fe ? " – " + fe.ToString("yyyy-MM-dd") : "")
+                : "—";
+            table.Rows.Add(r.Name, r.Files, r.JsonOffers?.ToString("N0") ?? "—", r.FrontierOffers?.ToString("N0") ?? "—", diff,
+                jsonPeriod, frontierPeriod, r.Status, r.Details);
+        }
+        table.EndLoadData();
+
+        _gridFrontier.DataSource = table;
+        ApplyFrontierFilter();
     }
 
     private void ClearGeoComparison()
@@ -1006,7 +1116,7 @@ public sealed class MainForm : Form
         table.Columns.Add("Уникальных сейчас", typeof(long));
         table.Columns.Add("Было", typeof(long));
         table.Columns.Add("Изменение", typeof(long));
-        table.Columns.Add("Изменение, %", typeof(double));
+        table.Columns.Add("Изменение %", typeof(double));
         table.Columns.Add(c.AverageCount >= 2 ? $"Среднее за {c.KeepDays} дн." : "Среднее за период", typeof(double));
         table.Columns.Add("Статус", typeof(string));
         table.Columns.Add("Впервые видели", typeof(string));
@@ -1092,6 +1202,7 @@ public sealed class MainForm : Form
         }
 
         r.Comparison.SetHidden(names, hidden);
+        ResultStore.SaveAsync(r);
         UpdateRowFromResult(r);
         ShowSelected();
         _status.Text = hidden
@@ -1214,6 +1325,76 @@ public sealed class MainForm : Form
         return sb.ToString();
     }
 
+    /// <summary>Выгрузка расхождений сверки с Фронтиром: по выбранной сети или по всем проверенным в этой сессии.</summary>
+    private void OnSaveFrontier(bool selectedOnly)
+    {
+        var withFrontier = _storage.Networks.Where(n => _results.TryGetValue(n.Id, out var res) && res.Frontier is not null).ToList();
+        if (withFrontier.Count == 0)
+        {
+            MessageBox.Show(this, "Нет результатов сверки с Фронтиром. Укажите ID ретейлера в настройках сети («Изменить…») и запустите проверку.",
+                Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        List<NetworkConfig> nets;
+        var selected = Selected();
+        bool selectedHas = selected is not null && withFrontier.Any(n => n.Id == selected.Id);
+        if (selectedOnly || withFrontier.Count == 1)
+        {
+            if (selectedOnly && !selectedHas)
+            {
+                MessageBox.Show(this, "Для выбранной сети нет результата сверки с Фронтиром.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            nets = selectedHas ? new List<NetworkConfig> { selected! } : withFrontier;
+        }
+        else
+        {
+            var answer = MessageBox.Show(this,
+                "Сохранить сверку с Фронтиром по всем сетям, проверенным в этой сессии?\n\nДа — по всем сетям\nНет — только по выбранной сети\nОтмена — ничего не делать",
+                "Сохранить сверку с Фронтиром", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) return;
+            if (answer == DialogResult.Yes) nets = withFrontier;
+            else if (selectedHas) nets = new List<NetworkConfig> { selected! };
+            else
+            {
+                MessageBox.Show(this, "Выберите в списке сеть, для которой есть результат сверки.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+        }
+
+        var items = nets.Select(n => (Network: n.Name, Result: _results[n.Id].Frontier!)).ToList();
+        if (items.Sum(i => i.Result.Problems) == 0)
+        {
+            MessageBox.Show(this, "Расхождений с Фронтиром нет — сохранять нечего.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string label = nets.Count == 1 ? SafeName(nets[0].Name) : "все_сети";
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Сохранить сверку с Фронтиром",
+            Filter = "Excel (*.xlsx)|*.xlsx|CSV для Excel (*.csv)|*.csv|Текстовый файл (*.txt)|*.txt|JSON (*.json)|*.json",
+            FileName = $"фронтир_{label}_{DateTime.Now:yyyyMMdd_HHmm}",
+            InitialDirectory = ExportDir(),
+            AddExtension = true,
+            OverwritePrompt = true,
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        try
+        {
+            FrontierExporter.Write(dlg.FileName, items);
+            Settings.LastExportDir = Path.GetDirectoryName(dlg.FileName);
+            SaveStorage();
+            _status.Text = "Сверка с Фронтиром сохранена: " + dlg.FileName;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Не удалось записать файл: " + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void OnSaveReport()
     {
         var net = Selected();
@@ -1257,6 +1438,7 @@ public sealed class MainForm : Form
             total += r.Run.Summary.NetworkIssues.Count;
         }
         if (r.Comparison is not null) total += r.Comparison.Problems;
+        if (r.Frontier is not null) total += r.Frontier.Problems;
         return total;
     }
 

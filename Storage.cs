@@ -28,12 +28,18 @@ public sealed class NetworkConfig
     /// <summary>Файлы или ссылки на фиды.</summary>
     public List<string> Sources { get; set; } = new();
     public Baseline Baseline { get; set; } = new();
+    /// <summary>ID ретейлера во Фронтире (retailer_ids в ссылке). Пусто — сверка с Фронтиром для сети отключена.</summary>
+    public int? FrontierRetailerId { get; set; }
+    /// <summary>Фильтр has_source_url: показывать только каталоги, пришедшие через фид.</summary>
+    public bool FrontierOnlyFromFeed { get; set; } = true;
 
     public NetworkConfig Clone() => new()
     {
         Id = Id,
         Name = Name,
         Enabled = Enabled,
+        FrontierRetailerId = FrontierRetailerId,
+        FrontierOnlyFromFeed = FrontierOnlyFromFeed,
         Sources = new List<string>(Sources),
         Baseline = new Baseline
         {
@@ -61,6 +67,13 @@ public sealed class AppSettings
     public double GeoDropPercent { get; set; } = 30;
     /// <summary>Часовой пояс для «сегодня» (UTC+N). 3 — Москва.</summary>
     public int TimezoneHours { get; set; } = 3;
+
+    /// <summary>Адрес Фронтира (веб-сокет берётся оттуда же: /ws/).</summary>
+    public string FrontierBaseUrl { get; set; } = "https://frontier.admin.edadeal.yandex-team.ru";
+    /// <summary>Допустимая разница числа офферов JSON и Фронтира, %.</summary>
+    public double FrontierTolerancePercent { get; set; } = 1;
+    /// <summary>Сколько дней длится каталог во Фронтире: период date_start … date_start + (N−1).</summary>
+    public int FrontierPeriodDays { get; set; } = 3;
 
     /// <summary>Подключения к S3 (по одному на бакет). Обычно один или два.</summary>
     public List<S3Settings> S3Connections { get; set; } = new();
@@ -114,6 +127,11 @@ public sealed class AppSettings
             c.SecretKeyEncrypted ??= "";
         }
         RunMode = Math.Clamp(RunMode, 0, 2);
+        if (string.IsNullOrWhiteSpace(FrontierBaseUrl)) FrontierBaseUrl = def.FrontierBaseUrl;
+        FrontierBaseUrl = FrontierBaseUrl.Trim().TrimEnd('/');
+        if (Uri.TryCreate(FrontierBaseUrl, UriKind.Absolute, out var fu)) FrontierBaseUrl = fu.GetLeftPart(UriPartial.Authority);
+        FrontierTolerancePercent = Math.Clamp(FrontierTolerancePercent, 0, 100);
+        FrontierPeriodDays = Math.Clamp(FrontierPeriodDays, 1, 30);
         KeepHistoryDays = Math.Clamp(KeepHistoryDays, 1, 365);
         GeoHistoryDays = Math.Clamp(GeoHistoryDays, 1, 3650);
         NetworkTolerancePercent = Math.Clamp(NetworkTolerancePercent, 0, 100);

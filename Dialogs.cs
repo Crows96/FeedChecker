@@ -37,6 +37,8 @@ internal sealed class NetworkDialog : Form
     private readonly TextBox _unique = new();
     private readonly TextBox _avg = new();
     private readonly TextBox _tol = new();
+    private readonly TextBox _frontier = new();
+    private readonly CheckBox _frontierFeed = new() { Text = "Только каталоги из фида (фильтр has_source_url)", AutoSize = true };
     private readonly NetworkConfig _cfg;
     private readonly List<string> _otherNames;
     private readonly List<string> _buckets;
@@ -56,7 +58,7 @@ internal sealed class NetworkDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(660, 540);
+        ClientSize = new Size(660, 614);
 
         Controls.Add(new Label { Text = "Название сети:", Left = 12, Top = 14, AutoSize = true });
         _name.SetBounds(12, 36, 636, 24);
@@ -82,13 +84,19 @@ internal sealed class NetworkDialog : Form
         AddRow(grp, "Допуск, %:", _tol, 116);
         grp.Controls.Add(new Label
         {
-            Text = "История за последние дни сравнивается всегда, эталон — это дополнительная ручная проверка.",
-            Left = 12, Top = 148, AutoSize = true, ForeColor = SystemColors.GrayText,
+            Text = "История сравнивается всегда; эталон — дополнительная ручная проверка.",
+            Left = 12, Top = 148, AutoSize = true, MaximumSize = new Size(610, 0), ForeColor = SystemColors.GrayText,
         });
         Controls.Add(grp);
 
-        var ok = new Button { Text = "Сохранить", Left = 462, Top = 494, Width = 90 };
-        var cancel = new Button { Text = "Отмена", Left = 558, Top = 494, Width = 90, DialogResult = DialogResult.Cancel };
+        Controls.Add(new Label { Text = "Фронтир (необязательно): ссылка на каталоги ретейлера или его ID:", Left = 12, Top = 486, AutoSize = true });
+        _frontier.SetBounds(12, 508, 636, 24);
+        Controls.Add(_frontier);
+        _frontierFeed.Location = new Point(12, 538);
+        Controls.Add(_frontierFeed);
+
+        var ok = new Button { Text = "Сохранить", Left = 462, Top = 574, Width = 90 };
+        var cancel = new Button { Text = "Отмена", Left = 558, Top = 574, Width = 90, DialogResult = DialogResult.Cancel };
         Controls.AddRange(new Control[] { ok, cancel });
         AcceptButton = ok;
         CancelButton = cancel;
@@ -101,6 +109,8 @@ internal sealed class NetworkDialog : Form
         _unique.Text = b.UniqueProducts?.ToString() ?? "";
         _avg.Text = b.AvgUniquePerGeo?.ToString("0.##", CultureInfo.CurrentCulture) ?? "";
         _tol.Text = b.TolerancePercent.ToString("0.##", CultureInfo.CurrentCulture);
+        _frontier.Text = _cfg.FrontierRetailerId?.ToString() ?? "";
+        _frontierFeed.Checked = _cfg.FrontierOnlyFromFeed;
 
         btnFiles.Click += (_, _) => OnAddFiles();
         btnUrl.Click += (_, _) =>
@@ -198,7 +208,23 @@ internal sealed class NetworkDialog : Form
             return;
         }
 
+        int? frontierId = null;
+        bool feedOnly = _frontierFeed.Checked;
+        string frontierText = _frontier.Text.Trim();
+        if (frontierText.Length > 0)
+        {
+            if (!FrontierUrl.TryParse(frontierText, out int fid, out bool? fromUrl))
+            {
+                Warn("Не удалось найти ID ретейлера Фронтира. Вставьте ссылку вида …/catalogs?retailer_ids=3705 или просто число.");
+                return;
+            }
+            frontierId = fid;
+            if (fromUrl is { } urlFlag) feedOnly = urlFlag;
+        }
+
         _cfg.Name = name;
+        _cfg.FrontierRetailerId = frontierId;
+        _cfg.FrontierOnlyFromFeed = feedOnly;
         _cfg.Sources = _sources.Items.Cast<object>().Select(o => o.ToString() ?? "").Where(s => s.Length > 0).ToList();
         _cfg.Baseline = new Baseline
         {
@@ -226,6 +252,10 @@ internal sealed class SettingsDialog : Form
     private readonly NumericUpDown _tol = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _geoDrop = new() { Minimum = 0, Maximum = 100 };
     private readonly NumericUpDown _tz = new() { Minimum = -12, Maximum = 14 };
+    private readonly TextBox _frBase = new();
+    private readonly NumericUpDown _frTol = new() { Minimum = 0, Maximum = 100, DecimalPlaces = 1, Increment = 0.5M };
+    private readonly NumericUpDown _frDays = new() { Minimum = 1, Maximum = 30 };
+    private readonly Label _frStatus = new() { AutoSize = true, MaximumSize = new Size(610, 0) };
     private readonly S3Editor _s3a;
     private readonly S3Editor _s3b;
 
@@ -248,17 +278,20 @@ internal sealed class SettingsDialog : Form
         tabs.TabPages.Add(general);
         tabs.TabPages.Add(pageA);
         tabs.TabPages.Add(pageB);
+        var pageF = new TabPage("Фронтир");
+        tabs.TabPages.Add(pageF);
         Controls.Add(tabs);
+        BuildFrontierPage(pageF);
 
         AddFolderRow(general, "Папка кэша (скачанные фиды):", _cache, 14);
         AddFolderRow(general, "Папка истории проверок:", _history, 76);
         _delete.SetBounds(12, 136, 400, 24);
         general.Controls.Add(_delete);
         AddNumberRow(general, "Хранить историю, дней:", _days, 176, "");
-        AddNumberRow(general, "Помнить гео, дней:", _geoDays, 208, "пропавший магазин/регион остаётся в списке «Пропало» столько дней");
-        AddNumberRow(general, "Допуск изменения по сети, %:", _tol, 240, "к прошлой проверке и к среднему за период");
-        AddNumberRow(general, "Порог падения офферов у гео, %:", _geoDrop, 272, "предупреждать, если у магазина/региона стало меньше на столько");
-        AddNumberRow(general, "Часовой пояс для «сегодня» (UTC+):", _tz, 304, "3 — Москва");
+        AddNumberRow(general, "Помнить гео, дней:", _geoDays, 214, "сколько дней пропавшее гео остаётся в списке «Пропало»");
+        AddNumberRow(general, "Допуск изменения по сети, %:", _tol, 252, "к прошлой проверке и к среднему за период");
+        AddNumberRow(general, "Порог падения офферов у гео, %:", _geoDrop, 290, "предупреждать, если у магазина или региона стало меньше на столько");
+        AddNumberRow(general, "Часовой пояс для «сегодня» (UTC+):", _tz, 328, "3 — Москва");
 
         var existing = _s.S3Connections;
         _s3a = new S3Editor(pageA, existing.Count > 0 ? existing[0] : null, null, null,
@@ -281,9 +314,87 @@ internal sealed class SettingsDialog : Form
         _tol.Value = (decimal)Math.Clamp(_s.NetworkTolerancePercent, 0, 100);
         _geoDrop.Value = (decimal)Math.Clamp(_s.GeoDropPercent, 0, 100);
         _tz.Value = Math.Clamp(_s.TimezoneHours, -12, 14);
+        _frBase.Text = _s.FrontierBaseUrl;
+        _frTol.Value = (decimal)Math.Clamp(_s.FrontierTolerancePercent, 0, 100);
+        _frDays.Value = Math.Clamp(_s.FrontierPeriodDays, 1, 30);
+        UpdateFrontierStatus();
 
         ok.Click += (_, _) => OnOk();
     }
+
+    private void BuildFrontierPage(TabPage page)
+    {
+        page.Controls.Add(new Label
+        {
+            Text = "Сверка с Фронтиром: после проверки сети программа загружает каталоги ретейлера из Фронтира и сравнивает с JSON число офферов и период. " +
+                   "Нужен VPN. Вход сохраняется на этом компьютере в зашифрованном виде. ID ретейлера (или ссылка на Фронтир) задаётся в настройках каждой сети.",
+            Left = 12, Top = 10, AutoSize = true, MaximumSize = new Size(610, 0), ForeColor = SystemColors.GrayText,
+        });
+        page.Controls.Add(new Label { Text = "Адрес Фронтира:", Left = 12, Top = 92, AutoSize = true });
+        _frBase.SetBounds(12, 114, 610, 24);
+        page.Controls.Add(_frBase);
+        _frStatus.Location = new Point(12, 152);
+        page.Controls.Add(_frStatus);
+        var login = new Button { Text = "Войти во Фронтир…", Left = 12, Top = 184, Width = 170 };
+        var test = new Button { Text = "Проверить соединение", Left = 190, Top = 184, Width = 170 };
+        var forget = new Button { Text = "Забыть вход", Left = 368, Top = 184, Width = 130 };
+        page.Controls.AddRange(new Control[] { login, test, forget });
+        AddNumberRow(page, "Допуск по числу офферов, %:", _frTol, 244, "разница JSON и Фронтира, начиная с которой считаем расхождением");
+        AddNumberRow(page, "Длительность каталога, дней:", _frDays, 290, "обычно 3: от date_start плюс ещё два дня");
+
+        login.Click += (_, _) =>
+        {
+            if (!TryFrontierUrl(out string url)) return;
+            using var dlg = new FrontierLoginForm(url);
+            dlg.ShowDialog(this);
+            UpdateFrontierStatus();
+        };
+        test.Click += async (_, _) =>
+        {
+            if (!TryFrontierUrl(out string url)) return;
+            string? cookie = FrontierSession.Load();
+            if (cookie is null) { _frStatus.Text = "Сначала войдите во Фронтир."; return; }
+            test.Enabled = false;
+            _frStatus.Text = "Проверяю соединение…";
+            try
+            {
+                await Task.Run(() => FrontierClient.TestAsync(url, cookie, CancellationToken.None));
+                _frStatus.Text = "Соединение установлено, вход принят.";
+            }
+            catch (Exception ex)
+            {
+                _frStatus.Text = "Не получилось: " + ex.Message;
+            }
+            finally
+            {
+                test.Enabled = true;
+            }
+        };
+        forget.Click += (_, _) =>
+        {
+            FrontierSession.Clear();
+            UpdateFrontierStatus();
+        };
+    }
+
+    private bool TryFrontierUrl(out string url)
+    {
+        url = _frBase.Text.Trim().TrimEnd('/');
+        if (Uri.TryCreate(url, UriKind.Absolute, out var u) && (u.Scheme == Uri.UriSchemeHttps || u.Scheme == Uri.UriSchemeHttp))
+        {
+            url = u.GetLeftPart(UriPartial.Authority); // https://хост — путь и параметры ссылки не нужны
+            _frBase.Text = url;
+            return true;
+        }
+        MessageBox.Show(this, "Укажите адрес Фронтира целиком, например https://frontier.admin.edadeal.yandex-team.ru",
+            Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
+    }
+
+    private void UpdateFrontierStatus() =>
+        _frStatus.Text = FrontierSession.Exists
+            ? $"Вход сохранён ({FrontierSession.SavedAtLocal:dd.MM.yyyy HH:mm})."
+            : "Входа нет: нажмите «Войти во Фронтир».";
 
     private void AddFolderRow(Control page, string caption, TextBox box, int top)
     {
@@ -305,7 +416,12 @@ internal sealed class SettingsDialog : Form
         box.SetBounds(270, top, 80, 24);
         page.Controls.Add(box);
         if (hint.Length > 0)
-            page.Controls.Add(new Label { Text = hint, Left = 360, Top = top + 3, AutoSize = true, ForeColor = SystemColors.GrayText });
+            page.Controls.Add(new Label
+            {
+                Text = hint, Left = 360, Top = top + 1, AutoSize = true,
+                MaximumSize = new Size(262, 0), // длинная подсказка переносится на вторую строку
+                ForeColor = SystemColors.GrayText,
+            });
     }
 
     private void OnOk()
@@ -328,6 +444,7 @@ internal sealed class SettingsDialog : Form
             return;
         }
 
+        if (!TryFrontierUrl(out string frontierUrl)) return;
         var a = _s3a.ToSettings();
         var b = _s3b.ToSettings();
         if (a is not null && b is not null && string.Equals(a.Bucket, b.Bucket, StringComparison.OrdinalIgnoreCase))
@@ -345,6 +462,9 @@ internal sealed class SettingsDialog : Form
         _s.NetworkTolerancePercent = (double)_tol.Value;
         _s.GeoDropPercent = (double)_geoDrop.Value;
         _s.TimezoneHours = (int)_tz.Value;
+        _s.FrontierBaseUrl = frontierUrl;
+        _s.FrontierTolerancePercent = (double)_frTol.Value;
+        _s.FrontierPeriodDays = (int)_frDays.Value;
 
         var list = new List<S3Settings>();
         if (a is not null) list.Add(a);
@@ -486,7 +606,7 @@ internal sealed class S3AddDialog : Form
         Controls.Add(new Label
         {
             Text = "Папка в бакете (например: winelab/) или полный адрес вида s3://бакет/папка/",
-            Left = 12, Top = 70, AutoSize = true,
+            Left = 12, Top = 70, AutoSize = true, MaximumSize = new Size(516, 0),
         });
         _folder.SetBounds(12, 92, 516, 24);
         Controls.Add(_folder);
