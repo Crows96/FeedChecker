@@ -313,7 +313,8 @@ public sealed class S3Client
     }
 
     /// <summary>Скачивает файл в папку кэша потоком. До трёх попыток при обрывах связи и ошибках сервера 5xx.</summary>
-    public async Task<string> DownloadAsync(string bucket, string key, string cacheDir, IProgress<double>? progress, CancellationToken ct)
+    public async Task<string> DownloadAsync(string bucket, string key, string cacheDir, IProgress<double>? progress, CancellationToken ct,
+        Action<DateTimeOffset?>? onLastModified = null)
     {
         Directory.CreateDirectory(cacheDir);
         string target = FeedDownloader.CachePathFor($"s3://{bucket}/{key}", cacheDir);
@@ -331,6 +332,7 @@ public sealed class S3Client
                     throw ErrorFrom(resp.StatusCode, body);
                 }
 
+                onLastModified?.Invoke(resp.Content.Headers.LastModified);
                 long? total = resp.Content.Headers.ContentLength;
                 await using (var src = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
                 await using (var dst = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true))

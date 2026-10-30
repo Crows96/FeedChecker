@@ -353,6 +353,8 @@ public static class ReportExporter
         if (s.MinGeo is not null) Add("Меньше всего офферов", $"{s.MinGeo.Name} — {s.MinGeo.Offers:N0}");
         if (s.MaxGeo is not null) Add("Больше всего офферов", $"{s.MaxGeo.Name} — {s.MaxGeo.Offers:N0}");
         Add("date_start", s.DateStartMax is null ? "—" : $"{s.DateStartMin:yyyy-MM-dd} … {s.DateStartMax:yyyy-MM-dd}");
+        Add("date_end", s.DateEndMax is null ? "—" : $"{s.DateEndMin:yyyy-MM-dd} … {s.DateEndMax:yyyy-MM-dd}");
+        Add("Файл изменён (Last-Modified)", s.LastModifiedMaxUtc is { } lm ? lm.ToLocalTime().ToString("dd.MM.yyyy HH:mm") : "—");
         Add("Ошибок", s.Errors);
         Add("Предупреждений", s.Warnings);
         if (r.Comparison is { } c)

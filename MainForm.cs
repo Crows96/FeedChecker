@@ -144,7 +144,7 @@ public sealed class MainForm : Form
         _list.Columns.Add("Сеть", 150);
         _list.Columns.Add("Источн.", 55);
         _list.Columns.Add("Статус", 100);
-        _list.Columns.Add("date_start", 80);
+        _list.Columns.Add("Дата фида", 80);
         _list.Columns.Add("Свежесть", 115);
         _list.Columns.Add("Проверено", 90);
         _list.ClientSizeChanged += (_, _) => FitNetworkColumn();
@@ -422,10 +422,10 @@ public sealed class MainForm : Form
             if (_results.TryGetValue(n.Id, out var r))
             {
                 var (text, color) = StatusOf(r);
-                SetRow(item, text, color, r.Run?.Summary.DateStartMax, r.FinishedLocal.ToString("dd.MM HH:mm"));
+                SetRow(item, text, color, r.Run is null ? null : FeedDate(r.Run.Summary.DateStartMax, r.Run.Summary.LastModifiedMaxUtc), r.FinishedLocal.ToString("dd.MM HH:mm"));
             }
             else if (rec is null) SetRow(item, "не проверялась", SystemColors.Window, null, "");
-            else SetRow(item, "по истории", SystemColors.Window, rec.DateStartMax, rec.TimestampUtc.ToLocalTime().ToString("dd.MM HH:mm"));
+            else SetRow(item, "по истории", SystemColors.Window, FeedDate(rec.DateStartMax, rec.LastModifiedMaxUtc), rec.TimestampUtc.ToLocalTime().ToString("dd.MM HH:mm"));
 
             if (n.Id == selectId) item.Selected = true;
         }
@@ -438,6 +438,10 @@ public sealed class MainForm : Form
         UpdateFreshLabel();
         ShowSelected();
     }
+
+    /// <summary>Дата фида для списка сетей: сегодняшняя, если сегодня обновился файл или date_start; иначе самая поздняя из дат.</summary>
+    private DateOnly? FeedDate(DateOnly? dateStart, DateTimeOffset? lastModifiedUtc) =>
+        FeedDates.Effective(dateStart, lastModifiedUtc, Settings.TimezoneHours, Settings.Today());
 
     private void SetRow(ListViewItem item, string status, Color color, DateOnly? date, string last)
     {
@@ -749,8 +753,8 @@ public sealed class MainForm : Form
     private bool NotFreshToday(NetworkConfig n)
     {
         DateOnly? date = null;
-        if (_results.TryGetValue(n.Id, out var r) && r.Run is not null) date = r.Run.Summary.DateStartMax;
-        else if (_lastRecords.TryGetValue(n.Id, out var rec)) date = rec?.DateStartMax;
+        if (_results.TryGetValue(n.Id, out var r) && r.Run is not null) date = FeedDate(r.Run.Summary.DateStartMax, r.Run.Summary.LastModifiedMaxUtc);
+        else if (_lastRecords.TryGetValue(n.Id, out var rec) && rec is not null) date = FeedDate(rec.DateStartMax, rec.LastModifiedMaxUtc);
         return date != Settings.Today();
     }
 
@@ -849,7 +853,7 @@ public sealed class MainForm : Form
         var item = ItemFor(r.Network.Id);
         if (item is null) return;
         var (text, color) = StatusOf(r);
-        SetRow(item, text, color, r.Run?.Summary.DateStartMax, r.FinishedLocal.ToString("dd.MM HH:mm"));
+        SetRow(item, text, color, r.Run is null ? null : FeedDate(r.Run.Summary.DateStartMax, r.Run.Summary.LastModifiedMaxUtc), r.FinishedLocal.ToString("dd.MM HH:mm"));
     }
 
     // ------------------------------------------------------------------ показ результата
@@ -915,7 +919,7 @@ public sealed class MainForm : Form
         SetGeos(rec.Geos.Select(g => new GeoRow { Name = g.Name, Offers = g.Offers, UniqueProducts = g.UniqueProducts, Files = "" }).ToList());
     }
 
-    private static string BuildSummary(NetworkConfig net, NetworkCheckResult r)
+    private string BuildSummary(NetworkConfig net, NetworkCheckResult r)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"Сеть: {net.Name}   (проверено {r.FinishedLocal:dd.MM.yyyy HH:mm})");
@@ -951,7 +955,46 @@ public sealed class MainForm : Form
         return sb.ToString();
     }
 
-    private static string BuildRunSummary(RunResult r)
+    /// <summary>Блок «Свежесть фида»: все три даты (Last-Modified, date_start, date_end) и общий вывод.</summary>
+    private void AppendFreshness(StringBuilder sb, NetworkSummary s)
+    {
+        var today = Settings.Today();
+        int tz = Settings.TimezoneHours;
+        var lmDate = FeedDates.LocalDate(s.LastModifiedMaxUtc, tz);
+
+        string Status(DateOnly? d)
+        {
+            var (f, days) = FreshnessInfo.Evaluate(d, today);
+            return FreshnessInfo.Text(f, days);
+        }
+
+        bool lmFresh = lmDate == today;
+        bool startFresh = s.DateStartMax == today;
+        string verdict = lmFresh && startFresh ? "АКТУАЛЕН (изменён сегодня, date_start сегодняшний)"
+            : lmFresh ? "АКТУАЛЕН (по дате изменения файла)"
+            : startFresh ? "АКТУАЛЕН (по date_start)"
+            : "НЕ АКТУАЛЕН: файл сегодня не менялся и date_start не сегодняшний";
+
+        sb.AppendLine($"Свежесть фида: {verdict}");
+        sb.AppendLine(s.LastModifiedMaxUtc is { } lm
+            ? $"  Last-Modified: {lm.ToOffset(TimeSpan.FromHours(tz)):dd.MM.yyyy HH:mm} — {Status(lmDate)}"
+            : "  Last-Modified: сервер дату не сообщил");
+        sb.AppendLine(s.DateStartMax is null
+            ? "  date_start: нет"
+            : $"  date_start: {(s.DateStartMin == s.DateStartMax ? $"{s.DateStartMax:yyyy-MM-dd}" : $"{s.DateStartMin:yyyy-MM-dd} … {s.DateStartMax:yyyy-MM-dd}")} — {Status(s.DateStartMax)}");
+        if (s.DateEndMax is { } end)
+        {
+            int left = end.DayNumber - today.DayNumber;
+            string endText = left >= 0 ? $"действует, осталось дней: {left}" : $"истёк {-left} дн. назад";
+            sb.AppendLine($"  date_end: {(s.DateEndMin == end ? $"{end:yyyy-MM-dd}" : $"{s.DateEndMin:yyyy-MM-dd} … {end:yyyy-MM-dd}")} — {endText}");
+        }
+        else
+        {
+            sb.AppendLine("  date_end: не указан");
+        }
+    }
+
+    private string BuildRunSummary(RunResult r)
     {
         var s = r.Summary;
         var sb = new StringBuilder();
@@ -976,8 +1019,7 @@ public sealed class MainForm : Form
             sb.AppendLine($"Больше всего офферов: {s.MaxGeo.Name} — {s.MaxGeo.Offers:N0}");
         }
 
-        if (s.DateStartMax is not null)
-            sb.AppendLine($"date_start: {s.DateStartMin:yyyy-MM-dd} … {s.DateStartMax:yyyy-MM-dd}");
+        AppendFreshness(sb, s);
 
         sb.AppendLine();
         sb.AppendLine($"Ошибок: {s.Errors:N0}    Предупреждений: {s.Warnings:N0}");
@@ -1002,7 +1044,8 @@ public sealed class MainForm : Form
                 continue;
             }
 
-            sb.AppendLine($"  {f.DisplayName}: {f.FileSizeBytes / 1024.0 / 1024.0:N1} МБ, {f.Elapsed.TotalSeconds:N1} c");
+            sb.AppendLine($"  {f.DisplayName}: {f.FileSizeBytes / 1024.0 / 1024.0:N1} МБ, {f.Elapsed.TotalSeconds:N1} c" +
+                          (f.LastModifiedUtc is { } fm ? $", изменён {fm.ToLocalTime():dd.MM.yyyy HH:mm}" : ""));
             sb.AppendLine($"      каталогов {f.CatalogCount:N0}, гео {f.GeoCount:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
         }
 
@@ -1296,7 +1339,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string BuildReportText(NetworkConfig net, NetworkCheckResult r)
+    private string BuildReportText(NetworkConfig net, NetworkCheckResult r)
     {
         var sb = new StringBuilder();
         sb.AppendLine(BuildSummary(net, r));

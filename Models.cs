@@ -24,6 +24,7 @@ public enum IssueCode
     MixedGeoTypes,
     // сравнение с историей и эталоном
     FeedStale,
+    FeedExpired,
     CompareFilesChanged,
     CompareTotalChanged,
     CompareVsAverage,
@@ -67,7 +68,8 @@ public static class IssueInfo
         IssueCode.DateStartInvalid => "date_start отсутствует или не читается",
         IssueCode.DateStartMismatch => "Разные date_start у каталогов",
         IssueCode.MixedGeoTypes => "В сети смешаны регионы и магазины",
-        IssueCode.FeedStale => "Фид не обновился сегодня (date_start)",
+        IssueCode.FeedStale => "Фид не обновился сегодня (ни файл, ни date_start)",
+        IssueCode.FeedExpired => "Срок действия фида истёк (date_end)",
         IssueCode.CompareFilesChanged => "Изменился состав файлов сети",
         IssueCode.CompareTotalChanged => "Показатель изменился относительно прошлой проверки",
         IssueCode.CompareVsAverage => "Показатель отклонился от среднего за период",
@@ -152,6 +154,11 @@ public sealed class FeedFileResult
 
     public DateOnly? DateStartMin { get; set; }
     public DateOnly? DateStartMax { get; set; }
+    /// <summary>date_end каталогов (необязателен): самый ранний и самый поздний.</summary>
+    public DateOnly? DateEndMin { get; set; }
+    public DateOnly? DateEndMax { get; set; }
+    /// <summary>Когда файл изменён: Last-Modified ответа сервера или S3, для локального файла — время изменения (UTC).</summary>
+    public DateTimeOffset? LastModifiedUtc { get; set; }
 
     public Dictionary<string, GeoStat> Geos { get; } = new(StringComparer.Ordinal);
     /// <summary>Офферы каталогов без гео.</summary>
@@ -177,6 +184,30 @@ public sealed class FeedFileResult
 }
 
 public enum Freshness { Unknown, Today, Stale, Future }
+
+public static class FeedDates
+{
+    public static DateOnly? LocalDate(DateTimeOffset? utc, int tzHours) =>
+        utc is null ? null : DateOnly.FromDateTime(utc.Value.UtcDateTime.AddHours(tzHours));
+
+    /// <summary>Самая поздняя из дат date_start и изменения файла: по ней видно, менялся ли фид с прошлой проверки.</summary>
+    public static DateOnly? Latest(DateOnly? dateStart, DateTimeOffset? lastModifiedUtc, int tzHours)
+    {
+        var lm = LocalDate(lastModifiedUtc, tzHours);
+        return dateStart is null ? lm : lm is null ? dateStart : (dateStart > lm ? dateStart : lm);
+    }
+
+    /// <summary>
+    /// Дата фида для проверки свежести: если сегодняшняя хотя бы одна из дат (date_start или изменение файла) — сегодня,
+    /// иначе самая поздняя из известных. Так фид с «вечным» date_start, но обновлённым файлом считается свежим.
+    /// </summary>
+    public static DateOnly? Effective(DateOnly? dateStart, DateTimeOffset? lastModifiedUtc, int tzHours, DateOnly today)
+    {
+        var lm = LocalDate(lastModifiedUtc, tzHours);
+        if (dateStart == today || lm == today) return today;
+        return Latest(dateStart, lastModifiedUtc, tzHours);
+    }
+}
 
 public static class FreshnessInfo
 {
@@ -222,6 +253,10 @@ public sealed class NetworkSummary
     public GeoRow? MaxGeo { get; init; }
     public DateOnly? DateStartMin { get; init; }
     public DateOnly? DateStartMax { get; init; }
+    public DateOnly? DateEndMin { get; init; }
+    public DateOnly? DateEndMax { get; init; }
+    /// <summary>Самое позднее изменение среди файлов сети (UTC); null — ни один источник не сообщил дату изменения.</summary>
+    public DateTimeOffset? LastModifiedMaxUtc { get; init; }
     public long Errors { get; init; }
     public long Warnings { get; init; }
     public List<GeoRow> Geos { get; init; } = new();
@@ -236,7 +271,7 @@ public sealed class NetworkSummary
         var issues = new List<FeedIssue>();
         long offers = 0;
         bool regions = false, shops = false;
-        DateOnly? dMin = null, dMax = null;
+        DateOnly? dMin = null, dMax = null, eMin = null, eMax = null;
 
         foreach (var f in valid)
         {
@@ -245,6 +280,8 @@ public sealed class NetworkSummary
             if (f.GeoType is GeoType.Shops or GeoType.Mixed) shops = true;
             if (f.DateStartMin is { } a && (dMin is null || a < dMin)) dMin = a;
             if (f.DateStartMax is { } b && (dMax is null || b > dMax)) dMax = b;
+            if (f.DateEndMin is { } ea && (eMin is null || ea < eMin)) eMin = ea;
+            if (f.DateEndMax is { } eb && (eMax is null || eb > eMax)) eMax = eb;
             allProducts.UnionWith(f.NoGeoProducts);
 
             foreach (var (geo, st) in f.Geos)
@@ -297,6 +334,9 @@ public sealed class NetworkSummary
             MaxGeo = rows.Count == 0 ? null : rows.MaxBy(r => r.Offers),
             DateStartMin = dMin,
             DateStartMax = dMax,
+            DateEndMin = eMin,
+            DateEndMax = eMax,
+            LastModifiedMaxUtc = valid.Where(f => f.LastModifiedUtc is not null).Select(f => f.LastModifiedUtc).DefaultIfEmpty(null).Max(),
             Errors = files.Sum(f => f.Issues.ErrorCount),
             Warnings = files.Sum(f => f.Issues.WarningCount) + issues.Count,
             Geos = rows,

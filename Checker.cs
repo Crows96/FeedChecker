@@ -298,7 +298,7 @@ public sealed class FeedAnalyzer
     private void ReadCatalog(JsonTokenStream js, Ctx c)
     {
         var res = c.Res;
-        string? id = null, dateStart = null;
+        string? id = null, dateStart = null, dateEnd = null;
         bool hasShops = false, hasRegions = false;
         var shops = new List<string>();
         var regions = new List<string>();
@@ -317,6 +317,12 @@ public sealed class FeedAnalyzer
             {
                 js.Read();
                 if (js.TokenType == JsonTokenType.String) dateStart = js.GetString();
+                else js.SkipValue();
+            }
+            else if (js.NameIs("date_end"u8))
+            {
+                js.Read();
+                if (js.TokenType == JsonTokenType.String) dateEnd = js.GetString();
                 else js.SkipValue();
             }
             else if (js.NameIs("offers"u8))
@@ -376,6 +382,14 @@ public sealed class FeedAnalyzer
         {
             res.Issues.Add(IssueCode.DateStartInvalid, res.DisplayName, where,
                 dateStart is null ? "Нет date_start" : "Не удалось прочитать date_start: " + dateStart);
+        }
+
+        // date_end необязателен: если он есть и читается — запоминаем для сводки и проверки срока действия
+        if (dateEnd is not null && DateTimeOffset.TryParse(dateEnd, CultureInfo.InvariantCulture, DateTimeStyles.None, out var endDto))
+        {
+            var e = DateOnly.FromDateTime(endDto.DateTime);
+            if (res.DateEndMin is null || e < res.DateEndMin) res.DateEndMin = e;
+            if (res.DateEndMax is null || e > res.DateEndMax) res.DateEndMax = e;
         }
 
         // география
@@ -502,7 +516,8 @@ public sealed class FeedAnalyzer
             v |= 2;
         }
 
-        bool allOk = st[0] == 2 && st[1] == 2 && st[2] == 2 && st[3] == 2 && st[4] == 2;
+        // url не обязателен (индекс 3): его отсутствие или пустое значение ошибкой не считаем
+        bool allOk = st[0] == 2 && st[1] == 2 && st[2] == 2 && st[4] == 2;
         if (allOk && !duplicate) return;
 
         string where = st[1] == 2 ? Encoding.UTF8.GetString(c.Id) : $"(оффер №{res.OfferObjects} без id)";
@@ -515,6 +530,7 @@ public sealed class FeedAnalyzer
             var empty = new List<string>();
             for (int i = 0; i < 5; i++)
             {
+                if (i == 3) continue; // url не обязателен
                 if (st[i] == 0) missing.Add(KeyNames[i]);
                 else if (st[i] == 1) empty.Add(KeyNames[i]);
             }
@@ -681,7 +697,9 @@ public static class FeedDownloader
         return Path.Combine(cacheDir, $"{name}_{hash}.json");
     }
 
-    public static async Task<string> DownloadAsync(string url, string cacheDir, IProgress<double>? progress, CancellationToken ct)
+    /// <param name="onLastModified">Получает значение заголовка Last-Modified ответа сервера (null, если сервер его не прислал).</param>
+    public static async Task<string> DownloadAsync(string url, string cacheDir, IProgress<double>? progress, CancellationToken ct,
+        Action<DateTimeOffset?>? onLastModified = null)
     {
         Directory.CreateDirectory(cacheDir);
         string target = CachePathFor(url, cacheDir);
@@ -690,6 +708,7 @@ public static class FeedDownloader
         {
             using var resp = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             resp.EnsureSuccessStatusCode();
+            onLastModified?.Invoke(resp.Content.Headers.LastModified);
             long? total = resp.Content.Headers.ContentLength;
 
             await using (var src = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
@@ -810,6 +829,7 @@ public sealed class FeedRunner
             var (src, listError) = work[i];
             string name = src.DisplayName;
             string? downloaded = null;
+            DateTimeOffset? lastModified = null; // Last-Modified ответа сервера / S3, для локальных файлов — время изменения файла
 
             void Report(string phase, double fraction) =>
                 progress?.Report(new RunProgress(i, work.Count, name, phase, (i + Math.Clamp(fraction, 0, 1)) / work.Count));
@@ -831,7 +851,7 @@ public sealed class FeedRunner
                 {
                     Report("Скачивание", 0);
                     var dl = new Progress<double>(p => Report("Скачивание", p * 0.5));
-                    downloaded = FeedDownloader.DownloadAsync(src.Value, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
+                    downloaded = FeedDownloader.DownloadAsync(src.Value, opt.CacheDir, dl, ct, lm => lastModified = lm).GetAwaiter().GetResult();
                     path = downloaded;
                     analysisStart = 0.5; analysisSpan = 0.5;
                 }
@@ -843,14 +863,18 @@ public sealed class FeedRunner
                         ?? throw new InvalidOperationException($"Для бакета «{bucket}» не заданы ключи доступа (Настройки → S3).");
                     Report("Скачивание", 0);
                     var dl = new Progress<double>(p => Report("Скачивание", p * 0.5));
-                    downloaded = s3Client.DownloadAsync(bucket, key, opt.CacheDir, dl, ct).GetAwaiter().GetResult();
+                    downloaded = s3Client.DownloadAsync(bucket, key, opt.CacheDir, dl, ct, lm => lastModified = lm).GetAwaiter().GetResult();
                     path = downloaded;
                     analysisStart = 0.5; analysisSpan = 0.5;
                 }
 
+                if (!src.IsUrl && !src.IsS3 && File.Exists(path))
+                    lastModified = new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
+
                 Report("Проверка", analysisStart);
                 var ap = new Progress<double>(p => Report("Проверка", analysisStart + p * analysisSpan));
                 var fileResult = analyzer.Analyze(path, name, ap, ct);
+                fileResult.LastModifiedUtc = lastModified;
                 result.Files.Add(fileResult);
                 onFileDone?.Invoke(i, fileResult);
             }

@@ -64,6 +64,9 @@ internal static class ResultStore
         public long UnreferencedOffers { get; set; }
         public DateOnly? DateStartMin { get; set; }
         public DateOnly? DateStartMax { get; set; }
+        public DateOnly? DateEndMin { get; set; }
+        public DateOnly? DateEndMax { get; set; }
+        public DateTimeOffset? LastModifiedUtc { get; set; }
         public long NoGeoOffers { get; set; }
         public long UniqueProducts { get; set; }
         public int GeoCount { get; set; }
@@ -141,6 +144,9 @@ internal static class ResultStore
                 UnreferencedOffers = f.UnreferencedOffers,
                 DateStartMin = f.DateStartMin,
                 DateStartMax = f.DateStartMax,
+                DateEndMin = f.DateEndMin,
+                DateEndMax = f.DateEndMax,
+                LastModifiedUtc = f.LastModifiedUtc,
                 NoGeoOffers = f.NoGeoOffers,
                 UniqueProducts = f.IsValid ? f.UniqueProducts() : 0,
                 GeoCount = f.GeoCount,
@@ -203,6 +209,9 @@ internal static class ResultStore
                     UnreferencedOffers = fd.UnreferencedOffers,
                     DateStartMin = fd.DateStartMin,
                     DateStartMax = fd.DateStartMax,
+                    DateEndMin = fd.DateEndMin,
+                    DateEndMax = fd.DateEndMax,
+                    LastModifiedUtc = fd.LastModifiedUtc,
                     NoGeoOffers = fd.NoGeoOffers,
                     UniqueProductsOverride = fd.UniqueProducts,
                     GeoCountOverride = fd.GeoCount,

@@ -104,16 +104,33 @@ public static class RunComparer
         var prev = past.LastOrDefault();
         res.Previous = prev;
 
-        // Запись «обновлялась», если date_start изменился с прошлой проверки. Неизменённые не идут в среднее.
-        cur.Updated = prev is null || cur.DateStartMax != prev.DateStartMax;
+        // Запись «обновлялась», если самая поздняя из дат (date_start или изменение файла) изменилась с прошлой проверки.
+        // Неизменённые не идут в среднее.
+        cur.Updated = prev is null ||
+                      FeedDates.Latest(cur.DateStartMax, cur.LastModifiedMaxUtc, s.TimezoneHours) !=
+                      FeedDates.Latest(prev.DateStartMax, prev.LastModifiedMaxUtc, s.TimezoneHours);
         var avgSet = past.Where(h => h.Updated && h.TimestampUtc >= cur.TimestampUtc.AddDays(-s.KeepDays)).ToList();
         res.AverageCount = avgSet.Count;
 
-        // свежесть по date_start
-        var (fresh, days) = FreshnessInfo.Evaluate(cur.DateStartMax, s.Today);
-        if (fresh is Freshness.Stale or Freshness.Future)
-            issues.Add(IssueCode.FeedStale, net, cur.DateStartMax?.ToString("yyyy-MM-dd") ?? "",
-                $"date_start {cur.DateStartMax:yyyy-MM-dd}, сегодня {s.Today:yyyy-MM-dd}: {FreshnessInfo.Text(fresh, days)}");
+        // Свежесть: проверяем сразу две даты — изменение файла (Last-Modified) и date_start; достаточно, чтобы одна была сегодняшней.
+        // Предупреждаем, только если не актуальна ни одна.
+        var lmDate = FeedDates.LocalDate(cur.LastModifiedMaxUtc, s.TimezoneHours);
+        var effective = FeedDates.Effective(cur.DateStartMax, cur.LastModifiedMaxUtc, s.TimezoneHours, s.Today);
+        var (fresh, days) = FreshnessInfo.Evaluate(effective, s.Today);
+        if (fresh is Freshness.Stale or Freshness.Future or Freshness.Unknown)
+        {
+            string lmText = cur.LastModifiedMaxUtc is { } lmu
+                ? $"файл изменён {lmu.ToOffset(TimeSpan.FromHours(s.TimezoneHours)):dd.MM.yyyy HH:mm}"
+                : "дата изменения файла неизвестна (сервер не прислал Last-Modified)";
+            string startText = cur.DateStartMax is { } ds ? $"date_start {ds:yyyy-MM-dd}" : "date_start не указан";
+            string endText = cur.DateEndMax is { } de ? $"; date_end {de:yyyy-MM-dd}" : "";
+            issues.Add(IssueCode.FeedStale, net, effective?.ToString("yyyy-MM-dd") ?? "",
+                $"Ни файл, ни дата не актуальны. {lmText}; {startText}{endText}; сегодня {s.Today:yyyy-MM-dd}");
+        }
+
+        if (cur.DateEndMax is { } endMax && endMax < s.Today)
+            issues.Add(IssueCode.FeedExpired, net, endMax.ToString("yyyy-MM-dd"),
+                $"date_end {endMax:yyyy-MM-dd} уже прошёл (сегодня {s.Today:yyyy-MM-dd}): срок действия предложений истёк");
 
         // состав файлов
         if (prev is not null && prev.Files != cur.Files)

@@ -243,7 +243,9 @@ public sealed class RunRecord
     public double AvgWithoutDuplicates { get; set; }
     public DateOnly? DateStartMin { get; set; }
     public DateOnly? DateStartMax { get; set; }
-    /// <summary>false — date_start не изменился с прошлой проверки (такая запись не идёт в среднее).</summary>
+    public DateOnly? DateEndMax { get; set; }
+    public DateTimeOffset? LastModifiedMaxUtc { get; set; }
+    /// <summary>false — дата фида не изменилась с прошлой проверки (такая запись не идёт в среднее).</summary>
     public bool Updated { get; set; } = true;
     public long Errors { get; set; }
     public long Warnings { get; set; }
@@ -264,6 +266,8 @@ public sealed class RunRecord
         AvgWithoutDuplicates = s.AvgOffersPerGeoWithoutDuplicates,
         DateStartMin = s.DateStartMin,
         DateStartMax = s.DateStartMax,
+        DateEndMax = s.DateEndMax,
+        LastModifiedMaxUtc = s.LastModifiedMaxUtc,
         Errors = s.Errors,
         Warnings = s.Warnings,
         FileNames = files.Select(f => f.DisplayName).ToList(),
