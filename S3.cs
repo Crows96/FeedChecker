@@ -136,7 +136,10 @@ internal static class SigV4
 
 // ===================== Клиент S3 (чтение: список и скачивание) =====================
 
-public sealed record S3Object(string Key, long Size);
+public sealed record S3Object(string Key, long Size, DateTimeOffset? LastModified = null);
+
+/// <summary>Файл .json / .xml / .yml из S3-папки: источник для проверки + размер и время последнего изменения (из листинга, без скачивания).</summary>
+public sealed record S3FolderFile(FeedSource Source, long Size, DateTimeOffset? LastModified);
 
 public sealed class S3Listing
 {
@@ -282,7 +285,9 @@ public sealed class S3Client
                 string key = Val(c, "Key") ?? "";
                 long.TryParse(Val(c, "Size"), NumberStyles.Integer, CultureInfo.InvariantCulture, out long size);
                 if (key.Length == 0 || key == prefix || key.EndsWith('/')) continue; // «маркер папки»
-                result.Files.Add(new S3Object(key, size));
+                DateTimeOffset? modified = DateTimeOffset.TryParse(Val(c, "LastModified"), CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal, out var lm) ? lm : null;
+                result.Files.Add(new S3Object(key, size, modified));
             }
 
             foreach (var p in root.Elements().Where(e => e.Name.LocalName == "CommonPrefixes"))
@@ -299,16 +304,29 @@ public sealed class S3Client
         return result;
     }
 
-    /// <summary>Файлы .json из S3-папки (только прямые, без вложенных папок), как источники для проверки.</summary>
+    /// <summary>Файлы .json / .xml / .yml из S3-папки (только прямые, без вложенных папок), как источники для проверки.</summary>
     public async Task<List<FeedSource>> ListFeedSourcesAsync(string folderUri, CancellationToken ct)
     {
         if (!S3Path.TryParse(folderUri, out var bucket, out var prefix))
             throw new InvalidOperationException("Неверный адрес S3: " + folderUri);
         var listing = await ListAsync(bucket, prefix, ct).ConfigureAwait(false);
         return listing.Files
-            .Where(f => f.Key.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            .Where(f => f.Key.EndsWith(".json", StringComparison.OrdinalIgnoreCase) || f.Key.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.Key.EndsWith(".yml", StringComparison.OrdinalIgnoreCase))
             .OrderBy(f => f.Key, StringComparer.Ordinal)
             .Select(f => new FeedSource($"s3://{bucket}/{f.Key}"))
+            .ToList();
+    }
+
+    /// <summary>Файлы .json / .xml / .yml из S3-папки вместе с датой изменения (берётся из листинга, файлы при этом не скачиваются).</summary>
+    public async Task<List<S3FolderFile>> ListFeedFilesAsync(string folderUri, CancellationToken ct)
+    {
+        if (!S3Path.TryParse(folderUri, out var bucket, out var prefix))
+            throw new InvalidOperationException("Неверный адрес S3: " + folderUri);
+        var listing = await ListAsync(bucket, prefix, ct).ConfigureAwait(false);
+        return listing.Files
+            .Where(f => f.Key.EndsWith(".json", StringComparison.OrdinalIgnoreCase) || f.Key.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) || f.Key.EndsWith(".yml", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f.Key, StringComparer.Ordinal)
+            .Select(f => new S3FolderFile(new FeedSource($"s3://{bucket}/{f.Key}"), f.Size, f.LastModified))
             .ToList();
     }
 

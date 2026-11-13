@@ -357,6 +357,7 @@ public sealed class FrontierRow
     {
         "OK" => 9,
         var s when s.StartsWith("Нет во Фронтире") => 0,
+        var s when s.StartsWith("Пропал") => 0,
         var s when s.StartsWith("Период старый") => 1,
         var s when s.StartsWith("Нет в JSON") => 3,
         _ => 2,
@@ -387,21 +388,138 @@ public sealed class FrontierComparison
     };
 }
 
+// ------------------------------------------------------------ история каталогов Фронтира
+
+/// <summary>Каталог во Фронтире на момент проверки (для истории).</summary>
+public sealed class FrontierCatalogRec
+{
+    public string Uuid { get; set; } = "";
+    public string Name { get; set; } = "";
+    public DateOnly? Start { get; set; }
+    public DateOnly? End { get; set; }
+    public long Offers { get; set; }
+}
+
+/// <summary>Снимок каталогов сети во Фронтире за одну проверку.</summary>
+public sealed class FrontierRunRecord
+{
+    public string NetworkId { get; set; } = "";
+    public int RetailerId { get; set; }
+    public DateTime TimestampUtc { get; set; }
+    public int Total { get; set; }
+    public int Fresh { get; set; }
+    public List<FrontierCatalogRec> Catalogs { get; set; } = new();
+}
+
+/// <summary>История лежит в %AppData%\FeedChecker\frontier-history\&lt;id сети&gt;\ГГГГММДД-ЧЧММСС-ммм.json, по файлу на проверку.</summary>
+public static class FrontierHistory
+{
+    private static string DirFor(string networkId) =>
+        Path.Combine(AppStorage.Dir, "frontier-history",
+            new string(networkId.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_').ToArray()));
+
+    /// <summary>Все снимки сети по возрастанию времени. Битые файлы пропускаются.</summary>
+    public static List<FrontierRunRecord> Load(string networkId)
+    {
+        var list = new List<FrontierRunRecord>();
+        string dir = DirFor(networkId);
+        if (!Directory.Exists(dir)) return list;
+        foreach (var file in Directory.EnumerateFiles(dir, "*.json"))
+        {
+            try
+            {
+                var rec = JsonSerializer.Deserialize<FrontierRunRecord>(File.ReadAllText(file, Encoding.UTF8), Json.Options);
+                if (rec is not null) list.Add(rec);
+            }
+            catch { /* повреждённый снимок пропускаем */ }
+        }
+        return list.OrderBy(r => r.TimestampUtc).ToList();
+    }
+
+    public static FrontierRunRecord Snapshot(string networkId, int retailerId, IReadOnlyList<FrontierCatalog> all, FrontierComparison cmp) => new()
+    {
+        NetworkId = networkId,
+        RetailerId = retailerId,
+        TimestampUtc = DateTime.UtcNow,
+        Total = cmp.FrontierCatalogs,
+        Fresh = cmp.Fresh,
+        Catalogs = all.Where(c => c.IsActive).Select(c => new FrontierCatalogRec
+        {
+            Uuid = c.Uuid,
+            Name = FrontierComparer.NameOf(c),
+            Start = c.DateStart,
+            End = c.DateEnd,
+            Offers = c.ActiveOffers,
+        }).ToList(),
+    };
+
+    public static void Save(FrontierRunRecord rec) =>
+        Json.WriteAtomic(Path.Combine(DirFor(rec.NetworkId), rec.TimestampUtc.ToString("yyyyMMdd-HHmmss-fff") + ".json"), rec);
+
+    public static void Purge(string networkId, int keepDays)
+    {
+        string dir = DirFor(networkId);
+        if (!Directory.Exists(dir)) return;
+        var limit = DateTime.UtcNow.AddDays(-keepDays);
+        foreach (var file in Directory.EnumerateFiles(dir, "*.json"))
+        {
+            try
+            {
+                var rec = JsonSerializer.Deserialize<FrontierRunRecord>(File.ReadAllText(file, Encoding.UTF8), Json.Options);
+                if (rec is not null && rec.TimestampUtc < limit) File.Delete(file);
+            }
+            catch { /* не критично */ }
+        }
+    }
+}
+
 public static class FrontierComparer
 {
+    public static string NameOf(FrontierCatalog c)
+    {
+        string name = c.GeoNames.Count > 0 ? string.Join(", ", c.GeoNames) : Snippet(c.Conditions);
+        return name.Length == 0 ? c.Uuid : name;
+    }
+
+    /// <summary>
+    /// Сверка по каталогам: сколько активных каталогов сейчас во Фронтире, у скольких из них период актуален
+    /// (date_start не раньше date_start в JSON) и что изменилось с прошлых проверок (past — снимки по возрастанию времени).
+    /// Гео из JSON с каталогами Фронтира не сопоставляются. tolerancePercent оставлен для совместимости и не используется.
+    /// </summary>
     public static FrontierComparison Compare(int retailerId, NetworkSummary summary, IReadOnlyList<FrontierCatalog> all,
-        double tolerancePercent, int periodDays)
+        double tolerancePercent, int periodDays, IReadOnlyList<FrontierRunRecord>? past = null)
     {
         periodDays = Math.Max(1, periodDays);
+        past ??= Array.Empty<FrontierRunRecord>();
         string net = summary.Name;
         var res = new FrontierComparison { RetailerId = retailerId, JsonGeos = summary.GeoCount };
         var issues = res.Issues;
         var catalogs = all.Where(c => c.IsActive).ToList();
         res.FrontierCatalogs = catalogs.Count;
 
-        string expectedText = summary.DateStartMax is { } ds
-            ? $"JSON date_start {ds:yyyy-MM-dd}, ожидаемый период {ds:yyyy-MM-dd} – {ds.AddDays(periodDays - 1):yyyy-MM-dd}"
+        DateOnly? exp = summary.DateStartMax;
+        DateOnly? expEnd = exp?.AddDays(periodDays - 1);
+        string expectedText = exp is { } ds
+            ? $"JSON date_start {ds:yyyy-MM-dd}, ожидаемый период {ds:yyyy-MM-dd} – {expEnd:yyyy-MM-dd}"
             : "в JSON нет date_start";
+        var today = DateOnly.FromDateTime(DateTime.Now);
+
+        // прошлые снимки: uuid → каталог (для «с какой проверки период не менялся»)
+        var pastMaps = past
+            .Select(p => (Time: p.TimestampUtc, Map: p.Catalogs.Where(x => x.Uuid.Length > 0)
+                .GroupBy(x => x.Uuid).ToDictionary(g => g.Key, g => g.First())))
+            .ToList();
+
+        DateTime? SameSince(FrontierCatalog c)
+        {
+            DateTime? since = null;
+            for (int i = pastMaps.Count - 1; i >= 0; i--)
+            {
+                if (pastMaps[i].Map.TryGetValue(c.Uuid, out var r) && r.Start == c.DateStart && r.End == c.DateEnd) since = pastMaps[i].Time;
+                else break;
+            }
+            return since;
+        }
 
         if (catalogs.Count == 0)
         {
@@ -411,178 +529,147 @@ public static class FrontierComparer
             return res;
         }
 
-        // индексы Фронтира
-        var byGeo = new Dictionary<string, List<FrontierCatalog>>(StringComparer.Ordinal);
-        var conditions = new Dictionary<FrontierCatalog, string>();
-        foreach (var c in catalogs)
-        {
-            foreach (var n in c.GeoNames.Select(Norm).Where(x => x.Length > 0).Distinct())
-            {
-                if (!byGeo.TryGetValue(n, out var l)) byGeo[n] = l = new List<FrontierCatalog>();
-                l.Add(c);
-            }
-            conditions[c] = Norm(c.Conditions);
-        }
-
-        // у магазинов адрес лежит в тексте условий каталога, а не в названии гео Фронтира
-        bool useConditions = summary.GeoType is GeoType.Shops or GeoType.Mixed;
-
-        var used = new HashSet<FrontierCatalog>();
         var rows = new List<FrontierRow>();
-        var pendingStale = new List<(string Geo, string Details)>();
-        int matched = 0, fresh = 0, stale = 0, missing = 0;
+        var stale = new List<FrontierCatalog>();
+        int fresh = 0, endMismatch = 0;
+        string? endExample = null;
         DateOnly? minStart = null, maxEnd = null;
 
-        foreach (var g in summary.Geos)
+        foreach (var c in catalogs)
         {
-            DateOnly? expStart = g.DateStart ?? summary.DateStartMax;
-            string key = Norm(g.Name);
-            List<FrontierCatalog> cands = byGeo.TryGetValue(key, out var found) ? found : new List<FrontierCatalog>();
-            if (cands.Count == 0 && useConditions && key.Length >= 5)
-                cands = catalogs.Where(x => ContainsToken(conditions[x], key)).ToList();
+            string name = NameOf(c);
+            if (c.DateStart is { } cs && (minStart is null || cs < minStart)) minStart = cs;
+            if (c.DateEnd is { } ce0 && (maxEnd is null || ce0 > maxEnd)) maxEnd = ce0;
 
-            if (cands.Count == 0)
-            {
-                missing++;
-                rows.Add(new FrontierRow
-                {
-                    Name = g.Name, Files = g.Files, JsonOffers = g.Offers, JsonStart = expStart, Status = "Нет во Фронтире",
-                    Details = "Каталог этого гео не найден среди каталогов Фронтира",
-                });
-                issues.Add(IssueCode.FrontierGeoMissing, net, g.Name, $"В JSON офферов: {g.Offers:N0}, во Фронтире каталога нет");
-                continue;
-            }
-
-            matched++;
-            foreach (var c in cands) used.Add(c);
-            var best = cands
-                .OrderByDescending(x => expStart is not null && x.DateStart == expStart)
-                .ThenByDescending(x => x.DateStart ?? DateOnly.MinValue)
-                .ThenByDescending(x => x.ActiveOffers)
-                .First();
-
-            if (best.DateStart is { } bs && (minStart is null || bs < minStart)) minStart = bs;
-            if (best.DateEnd is { } be && (maxEnd is null || be > maxEnd)) maxEnd = be;
-
-            var notes = new List<string>();
-            var details = new List<string>();
+            string status = "OK", details = "";
             bool isFresh = true;
-
-            if (expStart is { } exp)
+            if (exp is { } e)
             {
-                if (best.DateStart is null)
+                if (c.DateStart is null)
                 {
                     isFresh = false;
-                    notes.Add("Нет даты во Фронтире");
+                    status = "Нет даты во Фронтире";
+                    details = "У каталога во Фронтире нет даты начала";
                 }
-                else if (best.DateStart < exp)
+                else if (c.DateStart < e)
                 {
                     isFresh = false;
-                    stale++;
-                    notes.Add("Период старый");
-                    string d = $"во Фронтире {Range(best)}, в JSON date_start {exp:yyyy-MM-dd}";
-                    details.Add(d);
-                    pendingStale.Add((g.Name, d));
+                    status = "Период старый";
+                    details = $"во Фронтире {Range(c)}, в JSON date_start {e:yyyy-MM-dd}";
+                    if (c.Uuid.Length > 0 && SameSince(c) is { } since)
+                        details += $"; тот же период с проверки от {since.ToLocalTime():dd.MM.yyyy HH:mm}";
                 }
-                else
+                else if (c.DateStart == e && c.DateEnd is { } ce && ce != expEnd)
                 {
-                    DateOnly expEnd = exp.AddDays(periodDays - 1);
-                    if (best.DateStart > exp)
-                    {
-                        notes.Add("Другой период");
-                        string d = $"во Фронтире {Range(best)}, в JSON date_start {exp:yyyy-MM-dd}: Фронтир новее JSON";
-                        details.Add(d);
-                        issues.Add(IssueCode.FrontierPeriodMismatch, net, g.Name, d);
-                    }
-                    else if (best.DateEnd is { } e2 && e2 != expEnd)
-                    {
-                        notes.Add("Другой период");
-                        string d = $"период во Фронтире {Range(best)}, ожидалось {exp:yyyy-MM-dd} – {expEnd:yyyy-MM-dd}";
-                        details.Add(d);
-                        issues.Add(IssueCode.FrontierPeriodMismatch, net, g.Name, d);
-                    }
+                    status = "Другой период";
+                    details = $"период во Фронтире {Range(c)}, ожидалось {e:yyyy-MM-dd} – {expEnd:yyyy-MM-dd}";
+                    endMismatch++;
+                    endExample ??= $"{name} ({Range(c)})";
                 }
             }
 
-            if (isFresh) fresh++;
-
-            // число офферов сравниваем только у каталогов с актуальным периодом, иначе сравнение бессмысленно
-            if (isFresh)
-            {
-                long j = g.Offers, f = best.ActiveOffers;
-                double diffPct = j == 0 ? (f == 0 ? 0 : 100) : Math.Abs(f - j) * 100.0 / j;
-                if (diffPct > tolerancePercent)
-                {
-                    notes.Add("Число офферов отличается");
-                    string d = $"в JSON {j:N0}, во Фронтире {f:N0} (разница {f - j:+#,0;-#,0}, {diffPct:0.##}%); допуск {tolerancePercent:0.##}%";
-                    details.Add(d);
-                    issues.Add(IssueCode.FrontierOffersMismatch, net, g.Name, d);
-                }
-            }
-
-            if (cands.Count > 1) details.Add($"каталогов у гео во Фронтире: {cands.Count}, взят самый свежий");
+            if (status != "OK" && c.Uuid.Length > 0) details += (details.Length > 0 ? "; " : "") + "id каталога " + c.Uuid;
+            if (isFresh) fresh++; else stale.Add(c);
 
             rows.Add(new FrontierRow
             {
-                Name = g.Name,
-                Files = g.Files,
-                JsonOffers = g.Offers,
-                FrontierOffers = best.ActiveOffers,
-                JsonStart = expStart,
-                FrontierStart = best.DateStart,
-                FrontierEnd = best.DateEnd,
-                Status = notes.Count == 0 ? "OK" : string.Join("; ", notes),
-                Details = string.Join("; ", details),
+                Name = name,
+                FrontierOffers = c.ActiveOffers,
+                JsonStart = exp,
+                FrontierStart = c.DateStart,
+                FrontierEnd = c.DateEnd,
+                Status = status,
+                Details = details,
             });
-        }
-
-        // каталоги Фронтира, которым не нашлось гео в JSON
-        foreach (var c in catalogs.Where(x => !used.Contains(x)).ToList())
-        {
-            string name = c.GeoNames.Count > 0 ? string.Join(", ", c.GeoNames) : Snippet(c.Conditions);
-            rows.Add(new FrontierRow
-            {
-                Name = name, FrontierOffers = c.ActiveOffers, FrontierStart = c.DateStart, FrontierEnd = c.DateEnd,
-                Status = "Нет в JSON", Details = "Каталог есть во Фронтире, но такого гео нет в JSON",
-            });
-            issues.Add(IssueCode.FrontierGeoExtra, net, name,
-                $"Каталог есть во Фронтире (период {Range(c)}, офферов {c.ActiveOffers:N0}), но в JSON такого гео нет");
         }
 
         res.Fresh = fresh;
-        int total = summary.GeoCount;
+        int total = catalogs.Count;
+        int staleCount = stale.Count;
         string period = minStart is { } mn && maxEnd is { } mx ? $"{mn:yyyy-MM-dd} – {mx:yyyy-MM-dd}" : "период неизвестен";
 
-        if (matched == 0)
+        // ---- сравнение с прошлой проверкой
+        string historyText = "";
+        if (past.Count > 0)
         {
-            res.State = FrontierState.NoMatch;
-            res.Message = $"Не удалось сопоставить ни одно гео из JSON ({total:N0}) с каталогами Фронтира ({catalogs.Count:N0}). " +
-                          "Проверьте ID ретейлера и фильтр «только каталоги из фида».";
+            var prev = past[^1];
+            string prevTime = prev.TimestampUtc.ToLocalTime().ToString("dd.MM.yyyy HH:mm");
+            var curIds = catalogs.Select(c => c.Uuid).Where(u => u.Length > 0).ToHashSet();
+            var prevIds = prev.Catalogs.Select(c => c.Uuid).Where(u => u.Length > 0).ToHashSet();
+            // каталог «действует», если срок не истёк на сегодня (или срока нет)
+            bool Valid(DateOnly? end) => end is null || end >= today;
+            int prevValid = prev.Catalogs.Count(c => Valid(c.End));
+            int curValid = catalogs.Count(c => Valid(c.DateEnd));
+
+            var gone = prev.Catalogs.Where(c => c.Uuid.Length > 0 && !curIds.Contains(c.Uuid)).ToList();
+            var goneEarly = gone.Where(c => Valid(c.End)).ToList(); // пропали, хотя срок ещё не истёк
+            int added = curIds.Count(u => !prevIds.Contains(u));
+
+            historyText = $" С прошлой проверки ({prevTime}): было {prev.Total:N0}, стало {total:N0}; " +
+                          $"действующих было {prevValid:N0}, стало {curValid:N0}; " +
+                          $"пропало до окончания срока {goneEarly.Count:N0}, появилось {added:N0}.";
+
+            foreach (var g in goneEarly)
+            {
+                string gp = (g.Start?.ToString("yyyy-MM-dd") ?? "?") + " – " + (g.End?.ToString("yyyy-MM-dd") ?? "?");
+                string d = $"был при проверке от {prevTime}: период {gp}, офферов {g.Offers:N0}; сейчас во Фронтире его нет; id каталога {g.Uuid}";
+                rows.Add(new FrontierRow
+                {
+                    Name = g.Name,
+                    FrontierOffers = null,
+                    JsonStart = exp,
+                    FrontierStart = g.Start,
+                    FrontierEnd = g.End,
+                    Status = "Пропал с прошлой проверки",
+                    Details = d,
+                });
+                issues.Add(IssueCode.FrontierCatalogGone, net, g.Name, d);
+            }
+
+            if (curValid < prevValid)
+            {
+                var recent = past.Skip(Math.Max(0, past.Count - 5)).ToList();
+                issues.Add(IssueCode.FrontierCatalogsFewer, net, "Фронтир",
+                    $"Действующих каталогов стало меньше: при проверке от {prevTime} было {prevValid:N0} (с учётом истёкших к сегодня), сейчас {curValid:N0}. " +
+                    $"Пропало до окончания срока: {goneEarly.Count:N0}, появилось новых: {added:N0}. " +
+                    $"Всего каталогов в последних {recent.Count} проверках: {string.Join(", ", recent.Select(p => p.Total.ToString("N0")))}; сейчас {total:N0}");
+            }
         }
-        else if (fresh == total)
+
+        if (staleCount == 0)
         {
             res.State = FrontierState.Updated;
-            res.Message = $"Фронтир обновлён: у всех гео ({total:N0}) актуальный период. {expectedText}.";
-        }
-        else if (fresh == 0)
-        {
-            res.State = FrontierState.NotUpdated;
-            res.Message = $"Фронтир не обновлён: у всех сопоставленных гео ({matched:N0} из {total:N0}) период старый или не совпадает " +
-                          $"(во Фронтире {period}). {expectedText}.";
-            issues.Add(IssueCode.FrontierNotUpdated, net, "Фронтир", res.Message);
+            res.Message = $"Фронтир обновлён: каталогов {total:N0}, у всех актуальный период (во Фронтире {period}). {expectedText}.{historyText}";
         }
         else
         {
-            res.State = FrontierState.Partial;
-            res.Message = $"Фронтир обновлён частично: актуальный период у {fresh:N0} из {total:N0} гео " +
-                          $"(старый период: {stale:N0}, не найдено во Фронтире: {missing:N0}). {expectedText}.";
+            string groups = string.Join("; ", stale
+                .GroupBy(Range)
+                .OrderByDescending(g => g.Count())
+                .Take(5)
+                .Select(g => $"{g.Key}: {g.Count():N0}"));
+            if (fresh == 0)
+            {
+                res.State = FrontierState.NotUpdated;
+                res.Message = $"Фронтир не обновлён: у всех каталогов ({total:N0}) период старый (во Фронтире {groups}). {expectedText}.{historyText}";
+            }
+            else
+            {
+                res.State = FrontierState.Partial;
+                res.Message = $"Фронтир обновлён частично: актуальный период у {fresh:N0} из {total:N0} каталогов, " +
+                              $"не обновлено {staleCount:N0} (период во Фронтире у них: {groups}). {expectedText}.{historyText}";
+            }
             issues.Add(IssueCode.FrontierNotUpdated, net, "Фронтир", res.Message);
+
+            // при частичном обновлении перечисляем каталоги, которые не обновились; если не обновилось ничего — хватит одного сообщения
+            if (res.State == FrontierState.Partial)
+                foreach (var r in rows.Where(x => x.Status is "Период старый" or "Нет даты во Фронтире"))
+                    issues.Add(IssueCode.FrontierPeriodMismatch, net, r.Name, r.Details);
         }
 
-        // если обновилось только часть, подробно перечисляем, у кого период старый; если не обновилось ничего — хватит одного сообщения
-        if (res.State == FrontierState.Partial)
-            foreach (var (geo, d) in pendingStale)
-                issues.Add(IssueCode.FrontierPeriodMismatch, net, geo, d);
+        if (endMismatch > 0)
+            issues.Add(IssueCode.FrontierPeriodMismatch, net, "Период каталогов",
+                $"У {endMismatch:N0} каталогов с актуальным началом период заканчивается не {expEnd:yyyy-MM-dd}; например: {endExample}");
 
         res.Rows.AddRange(rows.OrderBy(r => r.Rank).ThenBy(r => r.Name, StringComparer.CurrentCulture));
         return res;
@@ -595,44 +682,6 @@ public static class FrontierComparer
     {
         s = s.Trim();
         return s.Length <= 80 ? s : s[..80] + "…";
-    }
-
-    /// <summary>Нижний регистр, ё как е, лишние пробелы схлопнуты.</summary>
-    private static string Norm(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) return "";
-        var sb = new StringBuilder(s.Length);
-        bool space = false;
-        foreach (char ch in s.Trim().ToLowerInvariant())
-        {
-            char c = ch == 'ё' ? 'е' : ch;
-            if (char.IsWhiteSpace(c))
-            {
-                if (!space) sb.Append(' ');
-                space = true;
-            }
-            else
-            {
-                sb.Append(c);
-                space = false;
-            }
-        }
-        return sb.ToString();
-    }
-
-    /// <summary>Подстрока найдена как целое «слово»: «…, 4» не совпадает с «…, 41» и «…, 36» с «…, 36б».</summary>
-    private static bool ContainsToken(string haystack, string needle)
-    {
-        int i = 0;
-        while ((i = haystack.IndexOf(needle, i, StringComparison.Ordinal)) >= 0)
-        {
-            bool leftOk = i == 0 || !char.IsLetterOrDigit(haystack[i - 1]);
-            int end = i + needle.Length;
-            bool rightOk = end >= haystack.Length || !char.IsLetterOrDigit(haystack[end]);
-            if (leftOk && rightOk) return true;
-            i++;
-        }
-        return false;
     }
 }
 
@@ -649,7 +698,21 @@ public static class FrontierChecker
 
             var catalogs = FrontierClient.LoadAsync(settings.FrontierBaseUrl, cookie, retailerId, net.FrontierOnlyFromFeed, ct)
                 .GetAwaiter().GetResult();
-            return FrontierComparer.Compare(retailerId, summary, catalogs, settings.FrontierTolerancePercent, settings.FrontierPeriodDays);
+            List<FrontierRunRecord> past;
+            try { past = FrontierHistory.Load(net.Id); }
+            catch { past = new List<FrontierRunRecord>(); }
+
+            var cmp = FrontierComparer.Compare(retailerId, summary, catalogs, settings.FrontierTolerancePercent, settings.FrontierPeriodDays, past);
+
+            // историю пополняем только успешной загрузкой; сбой записи на работу проверки не влияет
+            try
+            {
+                FrontierHistory.Save(FrontierHistory.Snapshot(net.Id, retailerId, catalogs, cmp));
+                FrontierHistory.Purge(net.Id, settings.KeepHistoryDays);
+            }
+            catch { /* история — удобство, а не обязательная часть проверки */ }
+
+            return cmp;
         }
         catch (OperationCanceledException)
         {

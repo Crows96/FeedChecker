@@ -39,9 +39,16 @@ public enum IssueCode
     FrontierOffersMismatch,
     FrontierGeoMissing,
     FrontierGeoExtra,
+    // добавлено позже: в конце, чтобы не сдвигать номера уже сохранённых кодов
+    UrlDescriptionMismatch,
+    FrontierCatalogGone,
+    FrontierCatalogsFewer,
+    S3FileStale,
+    OfferUnknownCategory,
+    YmlDateMissing,
 }
 
-public sealed record FeedIssue(IssueSeverity Severity, IssueCode Code, string File, string Where, string Details);
+public sealed record FeedIssue(IssueSeverity Severity, IssueCode Code, string File, string Where, string Details, string Url = "");
 
 public static class IssueInfo
 {
@@ -83,6 +90,12 @@ public static class IssueInfo
         IssueCode.FrontierOffersMismatch => "Фронтир: число офферов не совпадает с JSON",
         IssueCode.FrontierGeoMissing => "Фронтир: гео из JSON нет во Фронтире",
         IssueCode.FrontierGeoExtra => "Фронтир: каталога нет в JSON",
+        IssueCode.UrlDescriptionMismatch => "У одного url разные description",
+        IssueCode.FrontierCatalogGone => "Фронтир: каталог пропал до окончания срока",
+        IssueCode.FrontierCatalogsFewer => "Фронтир: действующих каталогов стало меньше",
+        IssueCode.S3FileStale => "S3: файл не обновлялся сегодня",
+        IssueCode.OfferUnknownCategory => "YML: категории оффера нет в categories",
+        IssueCode.YmlDateMissing => "YML: нет даты фида (yml_catalog date)",
         _ => code.ToString(),
     };
 }
@@ -98,13 +111,13 @@ public sealed class IssueCollector
     public List<FeedIssue> Items { get; } = new();
     public Dictionary<IssueCode, long> Totals { get; } = new();
 
-    public void Add(IssueCode code, string file, string where, string details)
+    public void Add(IssueCode code, string file, string where, string details, string url = "")
     {
         Totals[code] = Totals.GetValueOrDefault(code) + 1;
         int s = _stored.GetValueOrDefault(code);
         if (s >= _maxPerCode) return;
         _stored[code] = s + 1;
-        Items.Add(new FeedIssue(IssueInfo.SeverityOf(code), code, file, where, details));
+        Items.Add(new FeedIssue(IssueInfo.SeverityOf(code), code, file, where, details, url));
     }
 
     /// <summary>Добавить к счётчику без записи (когда подробности по остальным не собирались).</summary>
@@ -143,12 +156,20 @@ public sealed class FeedFileResult
     public TimeSpan Elapsed { get; set; }
     public long FileSizeBytes { get; set; }
 
+    /// <summary>Формат файла: "JSON" или "YML" (XML-фид yml_catalog). У YML нет географии и каталогов, есть категории.</summary>
+    public string Format { get; set; } = "JSON";
+    public int CategoryCount { get; set; }
+
     public GeoType GeoType { get; set; }
     public int CatalogCount { get; set; }
     /// <summary>Сколько id указано в каталогах (с дублями).</summary>
     public long CatalogOfferRefs { get; set; }
     /// <summary>Сколько объектов в массиве offers.</summary>
     public long OfferObjects { get; set; }
+    /// <summary>Сколько объектов в offers с ошибкой: нет обязательного ключа / пустое значение (description, id, image, price_new; url не обязателен) или дубль id.</summary>
+    public long BadOffers { get; set; }
+    /// <summary>Сколько ссылок в каталогах ведёт на офферы с ошибкой в обязательных ключах или без объекта в offers: они исключены из CatalogOfferRefs, гео и уникальных товаров.</summary>
+    public long ExcludedRefs { get; set; }
     public long MissingOffers { get; set; }
     public long UnreferencedOffers { get; set; }
 
@@ -238,6 +259,18 @@ public sealed class GeoRow
     public DateOnly? DateStart { get; init; }
 }
 
+/// <summary>Файл из S3-папки по данным листинга (до скачивания).</summary>
+public sealed class S3FileInfo
+{
+    public string Name { get; set; } = "";
+    public DateTime? LastModifiedUtc { get; set; }
+    public long SizeBytes { get; set; }
+    /// <summary>Не обновлялся сегодня (по дате изменения в S3).</summary>
+    public bool IsStale { get; set; }
+    /// <summary>Не скачивался и не проверялся: в итоги сети не входит.</summary>
+    public bool Skipped { get; set; }
+}
+
 public sealed class NetworkSummary
 {
     public string Name { get; init; } = "";
@@ -246,7 +279,20 @@ public sealed class NetworkSummary
     public GeoType GeoType { get; init; }
     public int GeoCount { get; init; }
     public long OffersWithDuplicates { get; init; }
+    /// <summary>Объектов в массивах offers (по валидным файлам) и сколько из них с ошибками. 0 — нет данных (старый сохранённый результат).</summary>
+    public long OfferObjects { get; init; }
+    public long BadOffers { get; init; }
+    /// <summary>Id из каталогов, для которых нет объекта в offers (по валидным файлам).</summary>
+    public long MissingOffers { get; init; }
+    /// <summary>Файлов в S3-папках сети (всего .json), из них обновлённых сегодня, и список не обновлённых. 0 — S3-папок нет или данных нет.</summary>
+    public int S3FilesTotal { get; init; }
+    public int S3FilesFresh { get; init; }
+    public List<S3FileInfo> S3StaleFiles { get; init; } = new();
+    /// <summary>Ссылок в каталогах на офферы с ошибками или без объекта в offers, не вошедших в итоги.</summary>
+    public long ExcludedOffers { get; init; }
     public long UniqueProducts { get; init; }
+    /// <summary>Сумма уникальных товаров по файлам (каждый файл считается отдельно, общие товары считаются дважды) — так считает Фронтир. 0 — нет данных (старый сохранённый результат).</summary>
+    public long UniqueProductsSumByFile { get; init; }
     public double AvgOffersPerGeoWithDuplicates { get; init; }
     public double AvgOffersPerGeoWithoutDuplicates { get; init; }
     public GeoRow? MinGeo { get; init; }
@@ -263,12 +309,14 @@ public sealed class NetworkSummary
     /// <summary>Проблемы уровня сети (гео повторяется в разных файлах и т.п.).</summary>
     public List<FeedIssue> NetworkIssues { get; init; } = new();
 
-    public static NetworkSummary Build(string name, IReadOnlyList<FeedFileResult> files)
+    public static NetworkSummary Build(string name, IReadOnlyList<FeedFileResult> files,
+        IReadOnlyList<S3FileInfo>? s3 = null, IReadOnlyList<FeedIssue>? extraIssues = null)
     {
         var valid = files.Where(f => f.IsValid).ToList();
         var geos = new Dictionary<string, (long Offers, HashSet<ulong> Products, List<string> Files, DateOnly? Date)>(StringComparer.Ordinal);
         var allProducts = new HashSet<ulong>();
         var issues = new List<FeedIssue>();
+        if (extraIssues is not null) issues.AddRange(extraIssues);
         long offers = 0;
         bool regions = false, shops = false;
         DateOnly? dMin = null, dMax = null, eMin = null, eMax = null;
@@ -327,7 +375,15 @@ public sealed class NetworkSummary
             GeoType = gt,
             GeoCount = rows.Count,
             OffersWithDuplicates = offers,
+            OfferObjects = valid.Sum(f => f.OfferObjects),
+            BadOffers = valid.Sum(f => f.BadOffers),
+            MissingOffers = valid.Sum(f => f.MissingOffers),
+            S3FilesTotal = s3?.Count ?? 0,
+            S3FilesFresh = s3?.Count(x => !x.IsStale) ?? 0,
+            S3StaleFiles = s3?.Where(x => x.IsStale).ToList() ?? new List<S3FileInfo>(),
+            ExcludedOffers = valid.Sum(f => f.ExcludedRefs),
             UniqueProducts = allProducts.Count,
+            UniqueProductsSumByFile = valid.Sum(f => f.UniqueProducts()),
             AvgOffersPerGeoWithDuplicates = rows.Count == 0 ? 0 : rows.Average(r => (double)r.Offers),
             AvgOffersPerGeoWithoutDuplicates = rows.Count == 0 ? 0 : rows.Average(r => (double)r.UniqueProducts),
             MinGeo = rows.Count == 0 ? null : rows.MinBy(r => r.Offers),

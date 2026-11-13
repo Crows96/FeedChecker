@@ -139,26 +139,31 @@ public static class RunComparer
 
         var bl = baseline is { IsEmpty: false } ? baseline : null;
 
-        void Metric(string name, bool dec, double now, Func<RunRecord, double> sel, double? expected)
+        void Metric(string name, bool dec, double now, Func<RunRecord, double> sel, double? expected, Func<RunRecord, bool>? hasValue = null, bool lowerIsBetter = false)
         {
-            double? p = prev is null ? null : sel(prev);
-            double? a = avgSet.Count == 0 ? null : avgSet.Average(sel);
+            // записи из старых версий могут не содержать показателя — такие в сравнение и среднее не берём
+            var samples = hasValue is null ? avgSet : avgSet.Where(hasValue).ToList();
+            double? p = prev is null || (hasValue is not null && !hasValue(prev)) ? null : sel(prev);
+            double? a = samples.Count == 0 ? null : samples.Average(sel);
             double? delta = Pct(now, p);
             var notes = new List<string>();
+            var good = new List<string>(); // для показателей, где меньше — лучше (например, офферы с ошибками)
 
-            if (delta is not null && Math.Abs(delta.Value) > tol)
+            if (delta is not null && (lowerIsBetter ? delta.Value > tol : Math.Abs(delta.Value) > tol))
             {
-                notes.Add("изменилось к прошлой проверке");
+                notes.Add(lowerIsBetter ? "выросло к прошлой проверке" : "изменилось к прошлой проверке");
                 issues.Add(IssueCode.CompareTotalChanged, net, name,
                     $"было {Fmt(p!.Value, dec)}, стало {Fmt(now, dec)} ({PctText(delta.Value)}); допуск {tol:0.#}%");
             }
+            else if (lowerIsBetter && delta is not null && delta.Value < -tol)
+                good.Add($"меньше, чем в прошлой проверке ({PctText(delta.Value)}) — хорошо");
 
             double? da = Pct(now, a);
-            if (avgSet.Count >= 2 && da is not null && Math.Abs(da.Value) > tol)
+            if (samples.Count >= 2 && da is not null && (lowerIsBetter ? da.Value > tol : Math.Abs(da.Value) > tol))
             {
                 notes.Add($"отклонение от среднего ({PctText(da.Value)})");
                 issues.Add(IssueCode.CompareVsAverage, net, name,
-                    $"среднее за {s.KeepDays} дн. по {avgSet.Count} проверкам: {Fmt(a!.Value, dec)}, сейчас {Fmt(now, dec)} ({PctText(da.Value)}); допуск {tol:0.#}%");
+                    $"среднее за {s.KeepDays} дн. по {samples.Count} проверкам: {Fmt(a!.Value, dec)}, сейчас {Fmt(now, dec)} ({PctText(da.Value)}); допуск {tol:0.#}%");
             }
 
             if (expected is not null && bl is not null)
@@ -172,7 +177,11 @@ public static class RunComparer
                 }
             }
 
+            if (lowerIsBetter && notes.Count == 0 && good.Count == 0 && samples.Count >= 2 && da is not null && da.Value < -tol)
+                good.Add($"ниже среднего ({PctText(da.Value)}) — хорошо");
+
             string status = notes.Count > 0 ? string.Join("; ", notes)
+                : good.Count > 0 ? string.Join("; ", good)
                 : prev is null && expected is null ? "нет истории"
                 : "OK";
             res.Metrics.Add(new MetricRow
@@ -182,7 +191,7 @@ public static class RunComparer
                 Current = now,
                 Previous = p,
                 DeltaPercent = delta,
-                Average = avgSet.Count >= 2 ? a : null,
+                Average = samples.Count >= 2 ? a : null,
                 Expected = expected,
                 Status = status,
                 HasProblem = notes.Count > 0,
@@ -192,6 +201,14 @@ public static class RunComparer
         Metric("Количество гео", false, cur.GeoCount, r => r.GeoCount, bl?.GeoCount);
         Metric("Офферов (с дублями)", false, cur.OffersWithDuplicates, r => r.OffersWithDuplicates, null);
         Metric("Уникальных товаров (без дублей)", false, cur.UniqueProducts, r => r.UniqueProducts, bl?.UniqueProducts);
+        Metric("Уникальных товаров (сумма по файлам)", false, cur.UniqueProductsSumByFile, r => r.UniqueProductsSumByFile, null, r => r.UniqueProductsSumByFile > 0);
+        Metric("Офферов с ошибками", false, cur.BadOffers, r => r.BadOffers, null, r => r.OfferObjects > 0, lowerIsBetter: true);
+        Metric("Ссылок на несуществующие офферы", false, cur.MissingOffers, r => r.MissingOffers, null, r => r.OfferObjects > 0, lowerIsBetter: true);
+        if (cur.S3FilesTotal > 0)
+        {
+            Metric("Файлов в S3-папках (всего)", false, cur.S3FilesTotal, r => r.S3FilesTotal, null, r => r.S3FilesTotal > 0);
+            Metric("Файлов в S3, обновлённых сегодня", false, cur.S3FilesFresh, r => r.S3FilesFresh, null, r => r.S3FilesTotal > 0);
+        }
         Metric("Среднее на гео (с дублями)", true, cur.AvgWithDuplicates, r => r.AvgWithDuplicates, null);
         Metric("Среднее на гео (без дублей)", true, cur.AvgWithoutDuplicates, r => r.AvgWithoutDuplicates, bl?.AvgUniquePerGeo);
 
@@ -333,6 +350,8 @@ public static class NetworkChecker
             CacheDir = settings.CacheDir,
             DeleteDownloaded = settings.DeleteDownloaded,
             S3ClientFor = bucket => settings.FindS3(bucket) is { } conn ? S3Client.FromSettings(conn) : null,
+            S3SkipStale = net.S3SkipStale,
+            TimezoneHours = settings.TimezoneHours,
         };
         var sources = net.Sources.Select(v => new FeedSource(v)).ToList();
         var run = new FeedRunner().Run(sources, net.Name, options, progress, null, ct);

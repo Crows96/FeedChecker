@@ -39,6 +39,7 @@ internal sealed class NetworkDialog : Form
     private readonly TextBox _tol = new();
     private readonly TextBox _frontier = new();
     private readonly CheckBox _frontierFeed = new() { Text = "Только каталоги из фида (фильтр has_source_url)", AutoSize = true };
+    private readonly CheckBox _s3Skip = new() { Text = "S3-папки: не скачивать и не проверять файлы, не обновлённые сегодня", AutoSize = true };
     private readonly NetworkConfig _cfg;
     private readonly List<string> _otherNames;
     private readonly List<string> _buckets;
@@ -58,7 +59,7 @@ internal sealed class NetworkDialog : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(660, 614);
+        ClientSize = new Size(660, 640);
 
         Controls.Add(new Label { Text = "Название сети:", Left = 12, Top = 14, AutoSize = true });
         _name.SetBounds(12, 36, 636, 24);
@@ -94,9 +95,11 @@ internal sealed class NetworkDialog : Form
         Controls.Add(_frontier);
         _frontierFeed.Location = new Point(12, 538);
         Controls.Add(_frontierFeed);
+        _s3Skip.Location = new Point(12, 564);
+        Controls.Add(_s3Skip);
 
-        var ok = new Button { Text = "Сохранить", Left = 462, Top = 574, Width = 90 };
-        var cancel = new Button { Text = "Отмена", Left = 558, Top = 574, Width = 90, DialogResult = DialogResult.Cancel };
+        var ok = new Button { Text = "Сохранить", Left = 462, Top = 600, Width = 90 };
+        var cancel = new Button { Text = "Отмена", Left = 558, Top = 600, Width = 90, DialogResult = DialogResult.Cancel };
         Controls.AddRange(new Control[] { ok, cancel });
         AcceptButton = ok;
         CancelButton = cancel;
@@ -111,6 +114,7 @@ internal sealed class NetworkDialog : Form
         _tol.Text = b.TolerancePercent.ToString("0.##", CultureInfo.CurrentCulture);
         _frontier.Text = _cfg.FrontierRetailerId?.ToString() ?? "";
         _frontierFeed.Checked = _cfg.FrontierOnlyFromFeed;
+        _s3Skip.Checked = _cfg.S3SkipStale;
 
         btnFiles.Click += (_, _) => OnAddFiles();
         btnUrl.Click += (_, _) =>
@@ -148,7 +152,7 @@ internal sealed class NetworkDialog : Form
         using var dlg = new OpenFileDialog
         {
             Title = "Выберите файлы фидов",
-            Filter = "JSON (*.json)|*.json|Все файлы (*.*)|*.*",
+            Filter = "Фиды (*.json;*.xml;*.yml)|*.json;*.xml;*.yml|JSON (*.json)|*.json|XML / YML (*.xml;*.yml)|*.xml;*.yml|Все файлы (*.*)|*.*",
             Multiselect = true,
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
@@ -225,6 +229,7 @@ internal sealed class NetworkDialog : Form
         _cfg.Name = name;
         _cfg.FrontierRetailerId = frontierId;
         _cfg.FrontierOnlyFromFeed = feedOnly;
+        _cfg.S3SkipStale = _s3Skip.Checked;
         _cfg.Sources = _sources.Items.Cast<object>().Select(o => o.ToString() ?? "").Where(s => s.Length > 0).ToList();
         _cfg.Baseline = new Baseline
         {
@@ -640,7 +645,8 @@ internal sealed class S3AddDialog : Form
             value = $"s3://{bucket}/{text.Trim('/')}/";
         }
 
-        if (!value.EndsWith('/') && !value.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) value += "/";
+        if (!value.EndsWith('/') && !value.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+            && !value.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) && !value.EndsWith(".yml", StringComparison.OrdinalIgnoreCase)) value += "/";
         Result = value;
         DialogResult = DialogResult.OK;
     }

@@ -69,6 +69,10 @@ internal static class ResultStore
         public DateTimeOffset? LastModifiedUtc { get; set; }
         public long NoGeoOffers { get; set; }
         public long UniqueProducts { get; set; }
+        public long BadOffers { get; set; }
+        public string Format { get; set; } = "JSON";
+        public int CategoryCount { get; set; }
+        public long ExcludedRefs { get; set; }
         public int GeoCount { get; set; }
         public IssuesDto Issues { get; set; } = new();
     }
@@ -149,6 +153,10 @@ internal static class ResultStore
                 LastModifiedUtc = f.LastModifiedUtc,
                 NoGeoOffers = f.NoGeoOffers,
                 UniqueProducts = f.IsValid ? f.UniqueProducts() : 0,
+                BadOffers = f.BadOffers,
+                Format = f.Format,
+                CategoryCount = f.CategoryCount,
+                ExcludedRefs = f.ExcludedRefs,
                 GeoCount = f.GeoCount,
                 Issues = IssuesDto.From(f.Issues),
             }).ToList(),
@@ -214,6 +222,10 @@ internal static class ResultStore
                     LastModifiedUtc = fd.LastModifiedUtc,
                     NoGeoOffers = fd.NoGeoOffers,
                     UniqueProductsOverride = fd.UniqueProducts,
+                    BadOffers = fd.BadOffers,
+                    Format = fd.Format,
+                    CategoryCount = fd.CategoryCount,
+                    ExcludedRefs = fd.ExcludedRefs,
                     GeoCountOverride = fd.GeoCount,
                 };
                 fd.Issues.FillTo(f.Issues);

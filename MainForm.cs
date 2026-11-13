@@ -913,7 +913,8 @@ public sealed class MainForm : Form
 
         sb.AppendLine("В этой сессии проверка не запускалась. Последняя сохранённая:");
         sb.AppendLine($"  {rec.TimestampUtc.ToLocalTime():dd.MM.yyyy HH:mm}, date_start {rec.DateStartMax:yyyy-MM-dd}");
-        sb.AppendLine($"  гео: {rec.GeoCount:N0}, офферов: {rec.OffersWithDuplicates:N0}, уникальных товаров: {rec.UniqueProducts:N0}");
+        sb.AppendLine($"  гео: {rec.GeoCount:N0}, офферов: {rec.OffersWithDuplicates:N0}, уникальных товаров: {rec.UniqueProducts:N0}" +
+                      (rec.UniqueProductsSumByFile > 0 ? $", сумма по файлам: {rec.UniqueProductsSumByFile:N0}" : ""));
         sb.AppendLine($"  среднее на гео: с дублями {rec.AvgWithDuplicates:N1}, без дублей {rec.AvgWithoutDuplicates:N1}");
         _summary.Text = sb.ToString();
         SetGeos(rec.Geos.Select(g => new GeoRow { Name = g.Name, Offers = g.Offers, UniqueProducts = g.UniqueProducts, Files = "" }).ToList());
@@ -947,7 +948,7 @@ public sealed class MainForm : Form
             sb.AppendLine();
             sb.AppendLine($"Фронтир (ретейлер {fr.RetailerId}): {fr.Message}");
             if (fr.State != FrontierState.Failed)
-                sb.AppendLine($"  каталогов во Фронтире: {fr.FrontierCatalogs:N0}, гео в JSON: {fr.JsonGeos:N0}, с актуальным периодом: {fr.Fresh:N0}, расхождений: {fr.Problems:N0}");
+                sb.AppendLine($"  каталогов во Фронтире: {fr.FrontierCatalogs:N0}, с актуальным периодом: {fr.Fresh:N0}, не обновлено: {fr.FrontierCatalogs - fr.Fresh:N0}");
         }
 
         sb.AppendLine();
@@ -1011,7 +1012,27 @@ public sealed class MainForm : Form
         sb.AppendLine();
         sb.AppendLine($"{geoWord}: {s.GeoCount:N0}");
         sb.AppendLine($"Офферов (с дублями): {s.OffersWithDuplicates:N0}");
+        if (s.OfferObjects > 0)
+        {
+            sb.AppendLine($"Объектов в offers: {s.OfferObjects:N0}");
+            sb.AppendLine($"  без ошибок: {s.OfferObjects - s.BadOffers:N0}");
+            sb.AppendLine($"  с ошибками: {s.BadOffers:N0}");
+            if (s.MissingOffers > 0)
+                sb.AppendLine($"Ссылок на несуществующие офферы (id из каталога нет в offers): {s.MissingOffers:N0}");
+            if (s.ExcludedOffers > 0)
+                sb.AppendLine($"  офферов (ссылок), не вошедших в итоги из-за ошибок или отсутствия оффера: {s.ExcludedOffers:N0}");
+        }
+        if (s.S3FilesTotal > 0)
+        {
+            sb.AppendLine($"Файлов в S3-папках: {s.S3FilesTotal:N0}, обновлённых сегодня: {s.S3FilesFresh:N0}, не обновлённых: {s.S3StaleFiles.Count:N0}");
+            foreach (var sf in s.S3StaleFiles.Take(30))
+                sb.AppendLine($"  не обновлён: {sf.Name} — последнее изменение {(sf.LastModifiedUtc is { } lmu ? lmu.AddHours(Settings.TimezoneHours).ToString("dd.MM.yyyy HH:mm") : "неизвестно")}" +
+                              (sf.Skipped ? " (не проверялся)" : " (проверен)"));
+            if (s.S3StaleFiles.Count > 30) sb.AppendLine($"  … и ещё {s.S3StaleFiles.Count - 30:N0}");
+        }
         sb.AppendLine($"Уникальных товаров (без дублей): {s.UniqueProducts:N0}");
+        if (s.UniqueProductsSumByFile > 0)
+            sb.AppendLine($"Уникальных товаров (сумма по файлам): {s.UniqueProductsSumByFile:N0}");
         sb.AppendLine($"Среднее офферов на гео:  с дублями {s.AvgOffersPerGeoWithDuplicates:N1},  без дублей {s.AvgOffersPerGeoWithoutDuplicates:N1}");
         if (s.MinGeo is not null && s.MaxGeo is not null)
         {
@@ -1046,7 +1067,12 @@ public sealed class MainForm : Form
 
             sb.AppendLine($"  {f.DisplayName}: {f.FileSizeBytes / 1024.0 / 1024.0:N1} МБ, {f.Elapsed.TotalSeconds:N1} c" +
                           (f.LastModifiedUtc is { } fm ? $", изменён {fm.ToLocalTime():dd.MM.yyyy HH:mm}" : ""));
-            sb.AppendLine($"      каталогов {f.CatalogCount:N0}, гео {f.GeoCount:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
+            if (f.Format == "YML")
+                sb.AppendLine($"      формат YML, категорий {f.CategoryCount:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
+            else
+                sb.AppendLine($"      каталогов {f.CatalogCount:N0}, гео {f.GeoCount:N0}, офферов {f.CatalogOfferRefs:N0}, уникальных товаров {f.UniqueProducts():N0}");
+            sb.AppendLine($"      объектов в offers {f.OfferObjects:N0}: без ошибок {f.OfferObjects - f.BadOffers:N0}, с ошибками {f.BadOffers:N0}" +
+                          (f.ExcludedRefs > 0 ? $" (не вошедших в итоги из-за ошибок: {f.ExcludedRefs:N0})" : ""));
         }
 
         return sb.ToString();
@@ -1107,19 +1133,17 @@ public sealed class MainForm : Form
         _lblFrontier.ForeColor = f.State == FrontierState.Updated ? Color.DarkGreen : Color.Firebrick;
 
         var table = new DataTable();
-        foreach (var col in new[] { "Гео", "Файл JSON", "В JSON", "Во Фронтире", "Разница", "Период JSON", "Период Фронтира", "Статус", "Подробности" })
+        foreach (var col in new[] { "Каталог", "Офферов во Фронтире", "Период JSON (ожидаемый)", "Период Фронтира", "Статус", "Подробности" })
             table.Columns.Add(col, typeof(string));
 
         table.BeginLoadData();
         foreach (var r in f.Rows)
         {
-            string diff = r.JsonOffers is { } j && r.FrontierOffers is { } fo ? (fo - j).ToString("+#,0;-#,0;0") : "—";
             string jsonPeriod = r.JsonStart is { } js ? js.ToString("yyyy-MM-dd") : "—";
             string frontierPeriod = r.FrontierStart is { } fs
                 ? fs.ToString("yyyy-MM-dd") + (r.FrontierEnd is { } fe ? " – " + fe.ToString("yyyy-MM-dd") : "")
                 : "—";
-            table.Rows.Add(r.Name, r.Files, r.JsonOffers?.ToString("N0") ?? "—", r.FrontierOffers?.ToString("N0") ?? "—", diff,
-                jsonPeriod, frontierPeriod, r.Status, r.Details);
+            table.Rows.Add(r.Name, r.FrontierOffers?.ToString("N0") ?? "—", jsonPeriod, frontierPeriod, r.Status, r.Details);
         }
         table.EndLoadData();
 
@@ -1263,10 +1287,11 @@ public sealed class MainForm : Form
         table.Columns.Add("Файл / сеть", typeof(string));
         table.Columns.Add("Проблема", typeof(string));
         table.Columns.Add("Где (каталог / оффер / гео)", typeof(string));
+        table.Columns.Add("Ссылка (url оффера)", typeof(string));
         table.Columns.Add("Подробности", typeof(string));
         table.BeginLoadData();
         foreach (var i in all.Take(maxRows))
-            table.Rows.Add(i.Severity == IssueSeverity.Error ? "Ошибка" : "Предупреждение", i.File, IssueInfo.Title(i.Code), i.Where, i.Details);
+            table.Rows.Add(i.Severity == IssueSeverity.Error ? "Ошибка" : "Предупреждение", i.File, IssueInfo.Title(i.Code), i.Where, i.Url, i.Details);
         table.EndLoadData();
 
         _gridIssues.DataSource = table;
@@ -1363,7 +1388,7 @@ public sealed class MainForm : Form
         foreach (var i in AllIssues(r).Take(5000))
         {
             string sev = i.Severity == IssueSeverity.Error ? "ОШИБКА" : "предупр.";
-            sb.AppendLine($"  [{sev}] {IssueInfo.Title(i.Code)} | {i.File} | {i.Where} | {i.Details}");
+            sb.AppendLine($"  [{sev}] {IssueInfo.Title(i.Code)} | {i.File} | {i.Where} | {i.Details}" + (i.Url.Length > 0 ? " | " + i.Url : ""));
         }
         return sb.ToString();
     }

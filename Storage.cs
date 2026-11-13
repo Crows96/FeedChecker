@@ -32,6 +32,8 @@ public sealed class NetworkConfig
     public int? FrontierRetailerId { get; set; }
     /// <summary>Фильтр has_source_url: показывать только каталоги, пришедшие через фид.</summary>
     public bool FrontierOnlyFromFeed { get; set; } = true;
+    /// <summary>Не скачивать и не проверять файлы из S3-папок, не обновлённые сегодня (по дате изменения в S3).</summary>
+    public bool S3SkipStale { get; set; } = true;
 
     public NetworkConfig Clone() => new()
     {
@@ -40,6 +42,7 @@ public sealed class NetworkConfig
         Enabled = Enabled,
         FrontierRetailerId = FrontierRetailerId,
         FrontierOnlyFromFeed = FrontierOnlyFromFeed,
+        S3SkipStale = S3SkipStale,
         Sources = new List<string>(Sources),
         Baseline = new Baseline
         {
@@ -239,6 +242,17 @@ public sealed class RunRecord
     public int GeoCount { get; set; }
     public long OffersWithDuplicates { get; set; }
     public long UniqueProducts { get; set; }
+    /// <summary>Сумма уникальных по файлам (как во Фронтире). 0 — запись из старой версии, без этого значения.</summary>
+    public long UniqueProductsSumByFile { get; set; }
+    /// <summary>Объектов в offers и сколько из них с ошибками. OfferObjects = 0 — запись из старой версии без этих значений.</summary>
+    public long OfferObjects { get; set; }
+    public long BadOffers { get; set; }
+    /// <summary>Id из каталогов без объекта в offers.</summary>
+    public long MissingOffers { get; set; }
+    /// <summary>Файлов в S3-папках всего / обновлённых сегодня и список не обновлённых. S3FilesTotal = 0 — S3-папок нет (или запись старой версии).</summary>
+    public int S3FilesTotal { get; set; }
+    public int S3FilesFresh { get; set; }
+    public List<S3FileInfo> S3StaleFiles { get; set; } = new();
     public double AvgWithDuplicates { get; set; }
     public double AvgWithoutDuplicates { get; set; }
     public DateOnly? DateStartMin { get; set; }
@@ -262,6 +276,14 @@ public sealed class RunRecord
         GeoCount = s.GeoCount,
         OffersWithDuplicates = s.OffersWithDuplicates,
         UniqueProducts = s.UniqueProducts,
+        UniqueProductsSumByFile = s.UniqueProductsSumByFile,
+        OfferObjects = s.OfferObjects,
+        BadOffers = s.BadOffers,
+        MissingOffers = s.MissingOffers,
+        S3FilesTotal = s.S3FilesTotal,
+        S3FilesFresh = s.S3FilesFresh,
+        S3StaleFiles = s.S3StaleFiles.Select(x => new S3FileInfo
+            { Name = x.Name, LastModifiedUtc = x.LastModifiedUtc, SizeBytes = x.SizeBytes, IsStale = x.IsStale, Skipped = x.Skipped }).ToList(),
         AvgWithDuplicates = s.AvgOffersPerGeoWithDuplicates,
         AvgWithoutDuplicates = s.AvgOffersPerGeoWithoutDuplicates,
         DateStartMin = s.DateStartMin,

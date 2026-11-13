@@ -144,7 +144,14 @@ public static class IdHash
         return h;
     }
 
-    /// <summary>Хэш «товара»: часть id до первого '_' (id оффера имеет вид "{товар}_{магазин}").</summary>
+    /// <summary>Смешивает два хэша в один (запасной вариант, сейчас не используется).</summary>
+    public static ulong Mix(ulong a, ulong b)
+    {
+        a ^= b + 0x9E3779B97F4A7C15UL + (a << 6) + (a >> 2);
+        return a;
+    }
+
+    /// <summary>Хэш «товара»: часть id до первого '_' (id оффера имеет вид "{товар}_{магазин}"). Сейчас не используется: товар определяется по description.</summary>
     public static ulong Product(ReadOnlySpan<byte> offerId)
     {
         int i = offerId.IndexOf((byte)'_');
@@ -185,6 +192,16 @@ public sealed class FeedAnalyzer
         public HashSet<string> CatalogIds { get; } = new(StringComparer.Ordinal);
         public byte[] IdBuf = new byte[256];
         public int IdLen;
+        /// <summary>Хэш id оффера → хэш товара (description). Заполняется при чтении массива offers.</summary>
+        public Dictionary<ulong, ulong> ProductOf { get; } = new();
+        /// <summary>Хэши id офферов с ошибкой в обязательных ключах: такие офферы не входят в итоговые числа.</summary>
+        public HashSet<ulong> BadIds { get; } = new();
+        /// <summary>Сколько раз id указан в каталогах сверх первого раза (чтобы точно знать число ссылок на оффер).</summary>
+        public Dictionary<ulong, int> RepeatRefs { get; } = new();
+        public byte[] DescBuf = new byte[256];
+        public int DescLen;
+        public byte[] UrlBuf = new byte[256];
+        public int UrlLen;
         public bool SawCatalogs, SawOffers, AnyRegions, AnyShops;
         public long Ticks;
         public double LastReported;
@@ -202,6 +219,10 @@ public sealed class FeedAnalyzer
 
     public FeedFileResult Analyze(string path, string displayName, IProgress<double>? progress, CancellationToken ct)
     {
+        // YML/XML-фиды: формат определяется по содержимому (файл начинается с «<»), а не по расширению
+        if (YmlFeedAnalyzer.LooksLikeXml(path))
+            return new YmlFeedAnalyzer(_opt).Analyze(path, displayName, progress, ct);
+
         var sw = Stopwatch.StartNew();
         var res = new FeedFileResult(displayName, _opt.MaxIssuesPerCode);
         var ctx = new Ctx(res) { Progress = progress };
@@ -333,9 +354,12 @@ public sealed class FeedAnalyzer
                 {
                     if (js.TokenType != JsonTokenType.String) { js.SkipValue(); continue; }
                     var b = js.ValueBytes;
-                    ref byte st = ref CollectionsMarshal.GetValueRefOrAddDefault(c.State, IdHash.Full(b), out _);
+                    ulong h = IdHash.Full(b);
+                    ref byte st = ref CollectionsMarshal.GetValueRefOrAddDefault(c.State, h, out _);
+                    if ((st & 1) != 0) c.RepeatRefs[h] = c.RepeatRefs.GetValueOrDefault(h) + 1;
                     st |= 1;
-                    products.Add(IdHash.Product(b));
+                    // пока храним хэши id офферов; в конце файла (Finish) они заменяются на хэши товаров (description)
+                    products.Add(h);
                     offersCount++;
                     Tick(js, c);
                 }
@@ -473,13 +497,36 @@ public sealed class FeedAnalyzer
         return false;
     }
 
+    private static void CopyTo(ref byte[] buf, ref int len, ReadOnlySpan<byte> src)
+    {
+        if (src.Length > buf.Length) buf = new byte[Math.Max(src.Length, buf.Length * 2)];
+        src.CopyTo(buf);
+        len = src.Length;
+    }
+
+    private static string Cut(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+    /// <summary>Описание оффера для отчёта: чтобы ошибку можно было найти в файле (№ в массиве offers, description, url).</summary>
+    private static string OfferContext(Ctx c)
+    {
+        var parts = new List<string>();
+        if (c.DescLen > 0) parts.Add("description: «" + Cut(Encoding.UTF8.GetString(c.DescBuf, 0, c.DescLen), 150) + "»");
+        return string.Join("; ", parts);
+    }
+
+    /// <summary>Полный url оффера (для отдельной колонки в выгрузке ошибок, чтобы его можно было скопировать).</summary>
+    private static string OfferUrl(Ctx c) => c.UrlLen > 0 ? Encoding.UTF8.GetString(c.UrlBuf, 0, c.UrlLen) : "";
+
     private void ReadOffer(JsonTokenStream js, Ctx c)
     {
         var res = c.Res;
         // состояние ключа: 0 — нет ключа, 1 — пусто, 2 — есть данные
         Span<byte> st = stackalloc byte[5];
         st.Clear();
+        ulong urlH = 0, descH = 0;
         c.IdLen = 0;
+        c.DescLen = 0;
+        c.UrlLen = 0;
 
         while (js.Read() && js.TokenType != JsonTokenType.EndObject)
         {
@@ -491,7 +538,20 @@ public sealed class FeedAnalyzer
             switch (js.TokenType)
             {
                 case JsonTokenType.String:
-                    if (HasData(js.ValueBytes)) s = 2;
+                    if (HasData(js.ValueBytes))
+                    {
+                        s = 2;
+                        if (k == 0)
+                        {
+                            descH = IdHash.Full(js.ValueBytes);
+                            CopyTo(ref c.DescBuf, ref c.DescLen, js.ValueBytes);
+                        }
+                        else if (k == 3)
+                        {
+                            urlH = IdHash.Full(js.ValueBytes);
+                            CopyTo(ref c.UrlBuf, ref c.UrlLen, js.ValueBytes);
+                        }
+                    }
                     break;
                 case JsonTokenType.Number:
                     s = 2;
@@ -506,23 +566,39 @@ public sealed class FeedAnalyzer
         }
 
         res.OfferObjects++;
+        long offerNo = res.OfferObjects;
         Tick(js, c);
 
         bool duplicate = false;
         if (st[1] == 2)
         {
-            ref byte v = ref CollectionsMarshal.GetValueRefOrAddDefault(c.State, IdHash.Full(c.Id), out _);
+            ulong idH = IdHash.Full(c.Id);
+            ref byte v = ref CollectionsMarshal.GetValueRefOrAddDefault(c.State, idH, out _);
             if ((v & 2) != 0) duplicate = true;
             v |= 2;
+            // товар = description: одинаковое название в разных магазинах/городах — один товар,
+            // разное название (например, «80 гр» и «100 гр») — разные товары. url не учитываем: в нём может быть город.
+            // Если description пустой (оффер и так помечен как некорректный), берём url.
+            ulong product = descH != 0 ? descH : urlH;
+            if (product != 0) c.ProductOf[idH] = product;
         }
 
         // url не обязателен (индекс 3): его отсутствие или пустое значение ошибкой не считаем
         bool allOk = st[0] == 2 && st[1] == 2 && st[2] == 2 && st[4] == 2;
-        if (allOk && !duplicate) return;
+        // офферы с ошибкой в обязательных ключах в итоговые числа не входят (дубль id сам по себе — не повод исключать)
+        if (!allOk && st[1] == 2) c.BadIds.Add(IdHash.Full(c.Id));
 
-        string where = st[1] == 2 ? Encoding.UTF8.GetString(c.Id) : $"(оффер №{res.OfferObjects} без id)";
+        if (allOk && !duplicate) return;
+        res.BadOffers++;
+
+        string where = st[1] == 2
+            ? $"{Encoding.UTF8.GetString(c.Id)} (оффер №{offerNo})"
+            : $"(оффер №{offerNo} без id)";
+        string context = OfferContext(c);
+
         if (duplicate)
-            res.Issues.Add(IssueCode.DuplicateOfferId, res.DisplayName, where, "Оффер с таким id уже встречался в этом файле");
+            res.Issues.Add(IssueCode.DuplicateOfferId, res.DisplayName, where,
+                "Оффер с таким id уже встречался в этом файле" + (context.Length > 0 ? "; " + context : ""), OfferUrl(c));
 
         if (!allOk)
         {
@@ -538,8 +614,48 @@ public sealed class FeedAnalyzer
             var parts = new List<string>();
             if (missing.Count > 0) parts.Add("нет ключа: " + string.Join(", ", missing));
             if (empty.Count > 0) parts.Add("пусто: " + string.Join(", ", empty));
-            res.Issues.Add(IssueCode.OfferFieldInvalid, res.DisplayName, where, string.Join("; ", parts));
+            if (context.Length > 0) parts.Add(context);
+            res.Issues.Add(IssueCode.OfferFieldInvalid, res.DisplayName, where, string.Join("; ", parts), OfferUrl(c));
         }
+    }
+
+    /// <summary>
+    /// Заменяет хэши id офферов в наборах гео на хэши товаров (description), чтобы один товар в разных
+    /// магазинах/регионах считался один раз. Если у id нет объекта оффера — он считается отдельным товаром.
+    /// </summary>
+    private static void ResolveProducts(Ctx c)
+    {
+        var map = c.ProductOf;
+        var bad = c.BadIds;
+
+        // removed — сколько id в наборе принадлежит офферам с ошибками (они не считаются ни офферами, ни товарами)
+        HashSet<ulong> Remap(HashSet<ulong> ids, out int removed)
+        {
+            removed = 0;
+            var r = new HashSet<ulong>();
+            foreach (var id in ids)
+            {
+                if (bad.Count > 0 && bad.Contains(id)) { removed++; continue; }
+                r.Add(map.TryGetValue(id, out var p) ? p : id);
+            }
+            return r;
+        }
+
+        var res = c.Res;
+        foreach (var gs in res.Geos.Values)
+        {
+            gs.Products = Remap(gs.Products, out int removed);
+            gs.Offers = Math.Max(0, gs.Offers - removed);
+        }
+
+        var noGeo = Remap(res.NoGeoProducts, out int removedNoGeo);
+        res.NoGeoOffers = Math.Max(0, res.NoGeoOffers - removedNoGeo);
+        res.NoGeoProducts.Clear();
+        res.NoGeoProducts.UnionWith(noGeo);
+
+        map.Clear();
+        bad.Clear();
+        c.RepeatRefs.Clear();
     }
 
     // ---------------------------------------------------------------- итоги и детализация
@@ -564,10 +680,25 @@ public sealed class FeedAnalyzer
         long missing = 0, unref = 0;
         foreach (var kv in c.State)
         {
-            if (kv.Value == 1) { missing++; if (missingSet.Count < _opt.DetailLimit) missingSet.Add(kv.Key); }
+            if (kv.Value == 1)
+            {
+                missing++;
+                if (missingSet.Count < _opt.DetailLimit) missingSet.Add(kv.Key);
+                // id из каталога без объекта в offers: оффера по сути нет, товар определить нельзя — в итоги не входит
+                c.BadIds.Add(kv.Key);
+            }
             else if (kv.Value == 2) { unref++; if (unrefSet.Count < _opt.DetailLimit) unrefSet.Add(kv.Key); }
         }
 
+        // сколько ссылок в каталогах ведёт на офферы с ошибками или без объекта в offers: их вычитаем из числа офферов
+        long excluded = 0;
+        foreach (var id in c.BadIds)
+            if (c.State.TryGetValue(id, out var sv) && (sv & 1) != 0)
+                excluded += 1 + c.RepeatRefs.GetValueOrDefault(id);
+        res.CatalogOfferRefs -= excluded;
+        res.ExcludedRefs = excluded;
+
+        ResolveProducts(c);
         c.State.Clear();
         res.MissingOffers = missing;
         res.UnreferencedOffers = unref;
@@ -583,6 +714,9 @@ public sealed class FeedAnalyzer
         long missingTotal, long unrefTotal, CancellationToken ct)
     {
         int foundMissing = 0, foundUnref = 0;
+        // собираем найденное, а выдаём в конце: так можно сопоставить ссылку без оффера с оффером, на который никто не ссылается
+        var missingFound = new List<(string Catalog, string OfferId)>();
+        var unrefFound = new List<string>();
         using (var fs = OpenRead(path))
         {
             var js = new JsonTokenStream(fs, ct);
@@ -620,9 +754,7 @@ public sealed class FeedAnalyzer
 
                         foreach (var offerId in pending)
                         {
-                            res.Issues.Add(IssueCode.CatalogOfferMissing, res.DisplayName,
-                                string.IsNullOrWhiteSpace(id) ? "(каталог без id)" : id!,
-                                "Id из каталога нет среди офферов: " + offerId);
+                            missingFound.Add((string.IsNullOrWhiteSpace(id) ? "(каталог без id)" : id!, offerId));
                             foundMissing++;
                         }
                     }
@@ -650,8 +782,7 @@ public sealed class FeedAnalyzer
 
                         if (offerId is not null)
                         {
-                            res.Issues.Add(IssueCode.OfferNotInCatalog, res.DisplayName, offerId,
-                                "Оффер есть в offers, но не указан ни в одном каталоге");
+                            unrefFound.Add(offerId);
                             foundUnref++;
                         }
                     }
@@ -662,6 +793,37 @@ public sealed class FeedAnalyzer
                     js.SkipValue();
                 }
             }
+        }
+
+        // Частая ошибка подрядчиков: в offers id имеет вид «товар_регион_адрес», а в каталоге — «товар_регион».
+        // Ключ сопоставления — id до второго «_».
+        static string BaseKey(string id)
+        {
+            int i = id.IndexOf('_');
+            if (i < 0) return id;
+            int j = id.IndexOf('_', i + 1);
+            return j < 0 ? id : id[..j];
+        }
+
+        var unrefByKey = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var u in unrefFound) unrefByKey.TryAdd(BaseKey(u), u);
+        var missingByKey = new Dictionary<string, (string Catalog, string OfferId)>(StringComparer.Ordinal);
+        foreach (var m in missingFound) missingByKey.TryAdd(BaseKey(m.OfferId), m);
+
+        foreach (var (catalog, offerId) in missingFound)
+        {
+            string details = $"В каталоге указан id «{offerId}», но оффера с таким id в offers нет";
+            if (unrefByKey.TryGetValue(BaseKey(offerId), out var cand) && cand.StartsWith(offerId, StringComparison.Ordinal))
+                details += $". Похоже на оффер «{cand}»: в offers id записан с адресом после региона, в каталоге — без него";
+            res.Issues.Add(IssueCode.CatalogOfferMissing, res.DisplayName, catalog, details);
+        }
+
+        foreach (var offerId in unrefFound)
+        {
+            string details = "Оффер есть в offers, но не указан ни в одном каталоге";
+            if (missingByKey.TryGetValue(BaseKey(offerId), out var cat) && offerId.StartsWith(cat.OfferId, StringComparison.Ordinal))
+                details += $". Похоже, на него ссылается каталог «{cat.Catalog}» под id «{cat.OfferId}» (без адреса в конце)";
+            res.Issues.Add(IssueCode.OfferNotInCatalog, res.DisplayName, offerId, details);
         }
 
         res.Issues.AddTotalOnly(IssueCode.CatalogOfferMissing, missingTotal - foundMissing);
@@ -777,6 +939,10 @@ public sealed class RunOptions
     public AnalyzerOptions Analyzer { get; set; } = new();
     /// <summary>Возвращает клиент S3 для бакета (или null, если для него нет ключей). Нужен, если есть источники s3://…</summary>
     public Func<string, S3Client?>? S3ClientFor { get; set; }
+    /// <summary>Не скачивать и не проверять файлы S3-папок, не обновлённые сегодня (по дате изменения в S3). Если в папке нет ни одного свежего файла, проверяются все.</summary>
+    public bool S3SkipStale { get; set; }
+    /// <summary>Часовой пояс для понятия «сегодня».</summary>
+    public int TimezoneHours { get; set; } = 3;
 }
 
 public sealed record RunProgress(int SourceIndex, int SourceCount, string SourceName, string Phase, double Overall);
@@ -786,6 +952,9 @@ public sealed class RunResult
     public List<FeedFileResult> Files { get; } = new();
     public NetworkSummary Summary { get; set; } = null!;
     public bool Cancelled { get; set; }
+    /// <summary>Все .json-файлы S3-папок по данным листинга (в том числе пропущенные как устаревшие).</summary>
+    public List<S3FileInfo> S3Files { get; } = new();
+    public List<FeedIssue> S3Issues { get; } = new();
 }
 
 /// <summary>Последовательно проверяет список источников (файлы, ссылки, S3-папки) как одну сеть.</summary>
@@ -808,9 +977,43 @@ public sealed class FeedRunner
                     throw new InvalidOperationException("Неверный адрес S3: " + s.Value);
                 var folderClient = opt.S3ClientFor?.Invoke(folderBucket)
                     ?? throw new InvalidOperationException($"Для бакета «{folderBucket}» не заданы ключи доступа (Настройки → S3).");
-                var files = folderClient.ListFeedSourcesAsync(s.Value, ct).GetAwaiter().GetResult();
-                if (files.Count == 0) throw new InvalidOperationException("В S3-папке нет файлов .json: " + s.Value);
-                foreach (var f in files) work.Add((f, null));
+                var files = folderClient.ListFeedFilesAsync(s.Value, ct).GetAwaiter().GetResult();
+                if (files.Count == 0) throw new InvalidOperationException("В S3-папке нет файлов .json / .xml / .yml: " + s.Value);
+
+                // свежесть по дате изменения из листинга: файлы для этого скачивать не нужно
+                var today = DateOnly.FromDateTime(DateTime.UtcNow.AddHours(opt.TimezoneHours));
+                bool IsStale(DateTimeOffset? lm) => lm is { } l && DateOnly.FromDateTime(l.UtcDateTime.AddHours(opt.TimezoneHours)) < today;
+                int freshCount = files.Count(f => !IsStale(f.LastModified));
+                // если в папке нет ни одного свежего файла, ничего не пропускаем: иначе сеть осталась бы без данных
+                bool skip = opt.S3SkipStale && freshCount > 0;
+
+                foreach (var f in files)
+                {
+                    bool stale = IsStale(f.LastModified);
+                    var info = new S3FileInfo
+                    {
+                        Name = f.Source.DisplayName,
+                        LastModifiedUtc = f.LastModified?.UtcDateTime,
+                        SizeBytes = f.Size,
+                        IsStale = stale,
+                        Skipped = stale && skip,
+                    };
+                    result.S3Files.Add(info);
+
+                    if (stale)
+                    {
+                        string lmText = info.LastModifiedUtc is { } u ? u.AddHours(opt.TimezoneHours).ToString("dd.MM.yyyy HH:mm") : "неизвестно";
+                        string action = info.Skipped
+                            ? "не скачивался и не проверялся"
+                            : freshCount == 0 && opt.S3SkipStale
+                                ? "проверен, т. к. в папке нет ни одного файла, обновлённого сегодня"
+                                : "проверен (пропуск устаревших файлов отключён)";
+                        result.S3Issues.Add(new FeedIssue(IssueSeverity.Warning, IssueCode.S3FileStale, s.Value, info.Name,
+                            $"Последнее изменение {lmText}, сегодня {today:dd.MM.yyyy}; файл {action}"));
+                    }
+
+                    if (!info.Skipped) work.Add((f.Source, null));
+                }
             }
             catch (OperationCanceledException)
             {
@@ -899,7 +1102,7 @@ public sealed class FeedRunner
             }
         }
 
-        result.Summary = NetworkSummary.Build(networkName, result.Files);
+        result.Summary = NetworkSummary.Build(networkName, result.Files, result.S3Files, result.S3Issues);
         progress?.Report(new RunProgress(work.Count, work.Count, "", result.Cancelled ? "Остановлено" : "Готово", result.Cancelled ? 0 : 1));
         return result;
     }
